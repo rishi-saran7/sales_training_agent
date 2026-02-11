@@ -11,9 +11,11 @@ const MESSAGE_TYPES = {
   AGENT_CONNECTED: "agent_connected",
   PING: "ping",
   PONG: "pong",
+  SCENARIO_SELECT: "scenario.select",
   USER_AUDIO_START: "user.audio.start",
   USER_AUDIO_CHUNK: "user.audio.chunk",
   USER_AUDIO_END: "user.audio.end",
+  USER_INTERRUPT: "user.interrupt",
   AGENT_AUDIO_START: "agent.audio.start",
   AGENT_AUDIO_CHUNK: "agent.audio.chunk",
   AGENT_AUDIO_END: "agent.audio.end",
@@ -22,6 +24,7 @@ const MESSAGE_TYPES = {
   STT_FINAL: "stt.final",
   AGENT_TEXT: "agent.text",
   CALL_END: "call.end",
+  CALL_RESET: "call.reset",
   CALL_FEEDBACK: "call.feedback",
 } as const;
 
@@ -46,6 +49,7 @@ type AgentMessage =
   | { type: typeof MESSAGE_TYPES.USER_AUDIO_START }
   | { type: typeof MESSAGE_TYPES.USER_AUDIO_CHUNK }
   | { type: typeof MESSAGE_TYPES.USER_AUDIO_END }
+  | { type: typeof MESSAGE_TYPES.USER_INTERRUPT }
   | { type: typeof MESSAGE_TYPES.AGENT_AUDIO_START }
   | { type: typeof MESSAGE_TYPES.AGENT_AUDIO_CHUNK; payload: string; format: string; sampleRate: number }
   | { type: typeof MESSAGE_TYPES.AGENT_AUDIO_END }
@@ -77,6 +81,34 @@ type RecordingHandles = {
   silentGain: GainNode;
 };
 
+const SCENARIOS = [
+  {
+    id: "price_sensitive_small_business",
+    name: "Price-Sensitive Small Business",
+    description: "Owner focused on cost, quick ROI, and limited budget.",
+  },
+  {
+    id: "enterprise_procurement_officer",
+    name: "Enterprise Procurement Officer",
+    description: "Procurement lead focused on compliance and contracts.",
+  },
+  {
+    id: "angry_existing_customer",
+    name: "Angry Existing Customer",
+    description: "Upset customer with a recent issue and low patience.",
+  },
+  {
+    id: "cold_uninterested_prospect",
+    name: "Cold Uninterested Prospect",
+    description: "Busy prospect with low interest and short attention span.",
+  },
+];
+
+type StartRecordingOptions = {
+  allowImmediateInterrupt?: boolean;
+  reason?: "manual" | "auto";
+};
+
 export default function HomePage() {
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [latency, setLatency] = useState<number | null>(null);
@@ -87,12 +119,32 @@ export default function HomePage() {
   const [callEnded, setCallEnded] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<FeedbackPayload | null>(null);
   const [callMetrics, setCallMetrics] = useState<{ duration: number; turns: number } | null>(null);
+  const [scenarioId, setScenarioId] = useState<string>(SCENARIOS[0]?.id || "");
+  const [scenarioLocked, setScenarioLocked] = useState<boolean>(false);
 
   const recordingRef = useRef<RecordingHandles | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const audioQueueRef = useRef<AudioBuffer[]>([]);
   const isPlayingRef = useRef<boolean>(false);
+  const currentSourceRef = useRef<AudioBufferSourceNode | null>(null); // Ref to currently playing source for barge-in stop.
+  const agentSpeakingRef = useRef<boolean>(false); // Ref mirror of agentSpeaking for use inside worklet callback.
+  const ignoreAgentAudioRef = useRef<boolean>(false); // Ignore incoming agent audio after barge-in.
+  const bargeInCooldownRef = useRef<boolean>(false); // Prevent repeated interrupt spam per utterance.
+  const bargeInHitCountRef = useRef<number>(0); // Count consecutive frames over threshold.
+  const bargeInTriggeredRef = useRef<boolean>(false); // Track if barge-in actually fired for this utterance.
+  const bargeInEnableAtRef = useRef<number>(0); // Timestamp after which barge-in is allowed for this utterance.
+
+  // TODO: Adaptive interruption thresholds — adjust BARGE_IN_ENERGY_THRESHOLD based on ambient noise levels.
+  const BARGE_IN_ENERGY_THRESHOLD = 0.02; // RMS energy threshold to detect user speech during agent playback.
+  const BARGE_IN_HITS_REQUIRED = 3; // Require consecutive frames over threshold to trigger barge-in.
+  const BARGE_IN_GRACE_MS = 300; // Short grace window to avoid false triggers on agent start.
+
+  function isAgentAudioActive() {
+    return agentSpeakingRef.current || isPlayingRef.current || audioQueueRef.current.length > 0;
+  }
+
+  const activeScenario = SCENARIOS.find((scenario) => scenario.id === scenarioId) || SCENARIOS[0];
 
   // Helper to decode base64 audio to PCM16 samples.
   function base64ToFloat32Array(base64: string, sampleRate: number): Float32Array {
@@ -110,10 +162,30 @@ export default function HomePage() {
     return floats;
   }
 
+  // Stop all agent audio playback immediately (barge-in).
+  function stopAgentPlayback() {
+    // Stop currently playing audio source.
+    if (currentSourceRef.current) {
+      try {
+        currentSourceRef.current.onended = null; // Prevent resolve callback.
+        currentSourceRef.current.stop();
+      } catch (_) { /* already stopped */ }
+      currentSourceRef.current = null;
+    }
+    // Clear queued buffers.
+    audioQueueRef.current = [];
+    isPlayingRef.current = false;
+    setAgentSpeaking(false);
+    agentSpeakingRef.current = false;
+    ignoreAgentAudioRef.current = true;
+    console.log("[barge-in] Agent audio playback stopped");
+  }
+
   // Play audio chunks from queue sequentially.
   async function playAudioQueue() {
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
     isPlayingRef.current = true;
+    agentSpeakingRef.current = true;
 
     if (!audioContextRef.current) {
       audioContextRef.current = new AudioContext();
@@ -135,12 +207,16 @@ export default function HomePage() {
       const source = audioContextRef.current.createBufferSource();
       source.buffer = buffer;
       source.connect(audioContextRef.current.destination);
+      currentSourceRef.current = source; // Track for barge-in stop.
       source.start();
 
       // Wait for this chunk to finish before playing next.
       await new Promise<void>((resolve) => {
         source.onended = () => {
           console.log("[audio] Chunk finished");
+          if (currentSourceRef.current === source) {
+            currentSourceRef.current = null;
+          }
           resolve();
         };
       });
@@ -149,6 +225,7 @@ export default function HomePage() {
     console.log("[audio] All chunks played");
     isPlayingRef.current = false;
     setAgentSpeaking(false);
+    agentSpeakingRef.current = false;
   }
 
   useEffect(() => {
@@ -218,11 +295,24 @@ export default function HomePage() {
         }
         case MESSAGE_TYPES.AGENT_AUDIO_START: {
           setAgentSpeaking(true);
+          agentSpeakingRef.current = true;
+          ignoreAgentAudioRef.current = false;
+          bargeInCooldownRef.current = false;
+          bargeInHitCountRef.current = 0;
+          bargeInTriggeredRef.current = false;
+          bargeInEnableAtRef.current = Date.now() + BARGE_IN_GRACE_MS;
           audioQueueRef.current = [];
           console.log("Agent audio start received");
+          if (micStatus !== "recording") {
+            console.log("[barge-in] Mic idle; automatic barge-in requires mic recording");
+          }
           break;
         }
         case MESSAGE_TYPES.AGENT_AUDIO_CHUNK: {
+          if (ignoreAgentAudioRef.current) {
+            // Ignore any late-arriving chunks after barge-in.
+            break;
+          }
           if (typeof parsed.payload === "string" && typeof parsed.sampleRate === "number") {
             try {
               console.log(`[audio] Received chunk: ${parsed.payload.length} chars, ${parsed.sampleRate}Hz`);
@@ -247,12 +337,14 @@ export default function HomePage() {
         }
         case MESSAGE_TYPES.AGENT_AUDIO_END: {
           console.log("Agent audio end received");
-          // Playback will finish naturally; agentSpeaking will be cleared after queue empties.
+          // Playback may still continue from buffered chunks; keep agentSpeakingRef true until queue drains.
           break;
         }
         case MESSAGE_TYPES.AGENT_INTERRUPT: {
-          // TODO: Stop playback when agent interrupt arrives (barge-in support).
-          console.log("Agent interrupt placeholder received");
+          // Barge-in: backend confirmed interruption — stop all playback immediately.
+          console.log("[barge-in] Agent interrupt received — stopping playback");
+          bargeInTriggeredRef.current = true;
+          stopAgentPlayback();
           break;
         }
         case MESSAGE_TYPES.STT_PARTIAL: {
@@ -315,11 +407,32 @@ export default function HomePage() {
     return btoa(binary);
   }
 
-  async function startRecording() {
+  async function startRecording(options: StartRecordingOptions = {}) {
+    const { allowImmediateInterrupt = true } = options;
     if (micStatus === "recording") return;
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
       console.warn("Socket not ready; cannot start recording");
       return;
+    }
+
+    if (!scenarioLocked && activeScenario) {
+      socketRef.current.send(
+        JSON.stringify({
+          type: MESSAGE_TYPES.SCENARIO_SELECT,
+          scenarioId: activeScenario.id,
+        })
+      );
+      setScenarioLocked(true);
+    }
+
+    // Barge-in: if agent is speaking when user starts recording, interrupt immediately.
+    if (allowImmediateInterrupt && agentSpeaking) {
+      console.log("[barge-in] User started recording while agent speaking — interrupting");
+      bargeInTriggeredRef.current = true;
+      stopAgentPlayback();
+      socketRef.current.send(
+        JSON.stringify({ type: MESSAGE_TYPES.USER_INTERRUPT })
+      );
     }
 
     // Resume audio context on user interaction to ensure browser allows playback.
@@ -350,6 +463,37 @@ export default function HomePage() {
 
       workletNode.port.onmessage = (event) => {
         if (event.data?.type === "chunk" && event.data?.payload instanceof ArrayBuffer) {
+          // Barge-in detection: compute RMS energy of audio chunk to detect user speech.
+          // TODO: Partial sentence recovery — save interrupted agent text for context.
+          if (
+            isAgentAudioActive() &&
+            !bargeInCooldownRef.current &&
+            Date.now() >= bargeInEnableAtRef.current
+          ) {
+            const pcm16 = new Int16Array(event.data.payload);
+            let sumSquares = 0;
+            for (let i = 0; i < pcm16.length; i++) {
+              const normalized = pcm16[i] / 32768.0;
+              sumSquares += normalized * normalized;
+            }
+            const rms = Math.sqrt(sumSquares / pcm16.length);
+
+            if (rms > BARGE_IN_ENERGY_THRESHOLD) {
+              bargeInHitCountRef.current += 1;
+              if (bargeInHitCountRef.current >= BARGE_IN_HITS_REQUIRED) {
+                console.log(`[barge-in] Speech detected (RMS: ${rms.toFixed(4)}), interrupting agent`);
+                bargeInTriggeredRef.current = true;
+                stopAgentPlayback();
+                socketRef.current?.send(
+                  JSON.stringify({ type: MESSAGE_TYPES.USER_INTERRUPT })
+                );
+                bargeInCooldownRef.current = true;
+              }
+            } else {
+              bargeInHitCountRef.current = 0;
+            }
+          }
+
           const base64Audio = bufferToBase64(event.data.payload);
           socketRef.current?.send(
             JSON.stringify({
@@ -408,24 +552,42 @@ export default function HomePage() {
     setMicStatus("idle");
   }
 
+  function handleSpeakButton() {
+    if (status !== "connected") return;
+    if (agentSpeaking) {
+      console.log("[barge-in] Manual interrupt requested");
+      bargeInTriggeredRef.current = true;
+      stopAgentPlayback();
+      socketRef.current?.send(
+        JSON.stringify({ type: MESSAGE_TYPES.USER_INTERRUPT })
+      );
+      return;
+    }
+    startRecording({ allowImmediateInterrupt: true, reason: "manual" });
+  }
+
   function endCall() {
     if (callEnded) return;
     // Stop any active recording.
     if (micStatus === "recording") {
       stopRecording();
     }
+    stopAgentPlayback();
     // Request feedback from backend.
     socketRef.current?.send(JSON.stringify({ type: MESSAGE_TYPES.CALL_END }));
     console.log("End call requested");
   }
 
   function resetCall() {
+    stopAgentPlayback();
     setCallEnded(false);
     setFeedback(null);
     setCallMetrics(null);
     setConversation([]);
     setPartialTranscript("");
     setAgentSpeaking(false);
+    setScenarioLocked(false);
+    socketRef.current?.send(JSON.stringify({ type: MESSAGE_TYPES.CALL_RESET }));
     console.log("Call reset");
   }
 
@@ -591,26 +753,61 @@ export default function HomePage() {
         <h1 style={{ margin: "0.4rem 0 0", fontSize: "2rem", fontWeight: 600 }}>
           {statusLabel}
         </h1>
+        {activeScenario && (
+          <p style={{ margin: "0.5rem 0 0", fontSize: "0.95rem", opacity: 0.9 }}>
+            Scenario: {activeScenario.name}
+          </p>
+        )}
         {latency !== null && (
           <p style={{ margin: "0.5rem 0 0", fontSize: "0.95rem", opacity: 0.9 }}>
             Latency: ~{latency} ms
           </p>
         )}
+        <div style={{ marginTop: "1rem" }}>
+          <label style={{ display: "block", fontSize: "0.85rem", opacity: 0.8, marginBottom: "0.35rem" }}>
+            Scenario Selection
+          </label>
+          <select
+            value={scenarioId}
+            onChange={(event) => setScenarioId(event.target.value)}
+            disabled={scenarioLocked}
+            style={{
+              width: "100%",
+              padding: "0.6rem 0.75rem",
+              borderRadius: "8px",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: scenarioLocked ? "#1f2937" : "#0f1e36",
+              color: "#e8eef5",
+              cursor: scenarioLocked ? "not-allowed" : "pointer",
+            }}
+          >
+            {SCENARIOS.map((scenario) => (
+              <option key={scenario.id} value={scenario.id}>
+                {scenario.name}
+              </option>
+            ))}
+          </select>
+          {activeScenario?.description && (
+            <p style={{ margin: "0.5rem 0 0", fontSize: "0.85rem", opacity: 0.75 }}>
+              {activeScenario.description}
+            </p>
+          )}
+        </div>
         <div style={{ marginTop: "1.5rem", display: "flex", gap: "0.75rem" }}>
           <button
-            onClick={startRecording}
-            disabled={micStatus === "recording" || status !== "connected" || agentSpeaking}
+            onClick={handleSpeakButton}
+            disabled={status !== "connected" || (micStatus === "recording" && !agentSpeaking)}
             style={{
               padding: "0.75rem 1.2rem",
               borderRadius: "10px",
               border: "1px solid rgba(255,255,255,0.2)",
-              background: micStatus === "recording" || agentSpeaking ? "#4b5563" : "#1f6feb",
+              background: micStatus === "recording" ? "#4b5563" : "#1f6feb",
               color: "white",
-              cursor: micStatus === "recording" || status !== "connected" || agentSpeaking ? "not-allowed" : "pointer",
+              cursor: status !== "connected" || (micStatus === "recording" && !agentSpeaking) ? "not-allowed" : "pointer",
               fontWeight: 600,
             }}
           >
-            Start Speaking
+            {agentSpeaking ? "Interrupt & Speak" : "Start Speaking"}
           </button>
           <button
             onClick={stopRecording}
