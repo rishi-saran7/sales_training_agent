@@ -3,16 +3,18 @@ const { DeepgramClient } = require('./deepgramClient');
 const { LlmClient } = require('./llmClient');
 const { TtsClient } = require('./ttsClient');
 
-const SILENCE_TIMEOUT_MS = 2000; // Wait 2 seconds after last speech to trigger LLM response.
+const SILENCE_TIMEOUT_MS = 3000; // Wait 3 seconds after last speech to trigger LLM response.
 
 // Message types keep the contract explicit and easy to extend later.
 const MESSAGE_TYPES = {
   AGENT_CONNECTED: 'agent_connected',
   PING: 'ping',
   PONG: 'pong',
+  SCENARIO_SELECT: 'scenario.select',
   USER_AUDIO_START: 'user.audio.start',
   USER_AUDIO_CHUNK: 'user.audio.chunk',
   USER_AUDIO_END: 'user.audio.end',
+  USER_INTERRUPT: 'user.interrupt',
   AGENT_AUDIO_START: 'agent.audio.start',
   AGENT_AUDIO_CHUNK: 'agent.audio.chunk',
   AGENT_AUDIO_END: 'agent.audio.end',
@@ -21,21 +23,86 @@ const MESSAGE_TYPES = {
   STT_FINAL: 'stt.final',
   AGENT_TEXT: 'agent.text',
   CALL_END: 'call.end',
+  CALL_RESET: 'call.reset',
   CALL_FEEDBACK: 'call.feedback',
 };
 
-const CUSTOMER_PERSONA_PROMPT =
+const BASE_CUSTOMER_PROMPT =
   'You are a realistic customer in a sales training simulation.\n' +
-  'You are skeptical, price-conscious, and time-limited.\n' +
+  'You are the CUSTOMER. The trainee is the salesperson.\n' +
+  'Never act like the agent or support rep. Do not say things like "How can I help you?" or "I can assist you."\n' +
+  'Never pitch, offer services, or describe products as if they are yours.\n' +
+  'If the trainee is vague (e.g., "services"), ask what they mean and request specifics.\n' +
   'IMPORTANT: Do NOT make assumptions about vague or unclear statements.\n' +
   'When the salesperson is unclear, vague, or rambling, respond with:\n' +
   '- "I didn\'t catch that. Can you repeat?"\n' +
   '- "I\'m not sure what you mean. Can you be more specific?"\n' +
   '- "Sorry, can you clarify what you\'re offering?"\n' +
   '- "I need you to be clearer about..."\n' +
+  'If you need details, ask as a customer (e.g., "What does that include?", "How much does it cost?", "What is the timeline?").\n' +
   'Ask direct follow-up questions when information is missing.\n' +
   'Challenge vague pitches by asking for concrete details.\n' +
   'Your goal is to train the salesperson to communicate clearly and specifically.';
+
+const SCENARIOS = [
+  {
+    id: 'price_sensitive_small_business',
+    name: 'Price-Sensitive Small Business',
+    description: 'Owner/operator focused on cost, quick ROI, and limited budget.',
+    systemPrompt:
+      BASE_CUSTOMER_PROMPT +
+      '\nYou are a small business owner focused on keeping costs low and seeing quick ROI.\n' +
+      'You are price-sensitive, ask about discounts, and push back on premium tiers.\n' +
+      'FIRST RESPONSE MUST reference budget sensitivity and ask for pricing or discounts.',
+  },
+  {
+    id: 'enterprise_procurement_officer',
+    name: 'Enterprise Procurement Officer',
+    description: 'Procurement lead focused on compliance, vendor risk, and contracts.',
+    systemPrompt:
+      BASE_CUSTOMER_PROMPT +
+      '\nYou are an enterprise procurement officer evaluating vendors.\n' +
+      'You care about compliance, SLAs, security, and procurement process details.\n' +
+      'FIRST RESPONSE MUST ask about compliance, security, and procurement process requirements.',
+  },
+  {
+    id: 'angry_existing_customer',
+    name: 'Angry Existing Customer',
+    description: 'Upset customer with a recent issue and low patience.',
+    systemPrompt:
+      BASE_CUSTOMER_PROMPT +
+      '\nYou are an existing customer who is angry about a recent issue.\n' +
+      'You are impatient, want accountability, and need a clear resolution plan.\n' +
+      'FIRST RESPONSE MUST start with a complaint and urgency about the unresolved issue.',
+  },
+  {
+    id: 'cold_uninterested_prospect',
+    name: 'Cold Uninterested Prospect',
+    description: 'Busy prospect with low interest and short attention span.',
+    systemPrompt:
+      BASE_CUSTOMER_PROMPT +
+      '\nYou are a cold prospect with low interest and limited time.\n' +
+      'You ask why this matters and try to end the call quickly unless it is compelling.\n' +
+      'FIRST RESPONSE MUST signal low interest and time pressure.',
+  },
+];
+
+const ROLE_COMPLIANCE_SUFFIX =
+  '\nROLE COMPLIANCE (STRICT): You are the CUSTOMER. The trainee is the salesperson.\n' +
+  'Do not act like an agent or support rep. Never say you can help, assist, resolve, or handle their issue.\n' +
+  'Always respond as the customer with customer needs, concerns, and questions.';
+
+const SCENARIO_MAP = SCENARIOS.reduce((acc, scenario) => {
+  acc[scenario.id] = {
+    ...scenario,
+    systemPrompt: `${scenario.systemPrompt}${ROLE_COMPLIANCE_SUFFIX}`,
+  };
+  return acc;
+}, {});
+
+// TODO: Add scenario difficulty levels.
+// TODO: Add industry-specific scripts.
+// TODO: Support trainer-created custom scenarios.
 
 // Track basic stream state per connection so we can log duration and sizes.
 function createStreamState() {
@@ -68,17 +135,43 @@ function setupWebsocket(server) {
     let deepgramClient = null;
     const llmClient = new LlmClient();
     const ttsClient = new TtsClient(process.env.DEEPGRAM_API_KEY || '');
-    const conversation = [
-      {
-        role: 'system',
-        content: CUSTOMER_PERSONA_PROMPT,
-      },
-    ];
+    let conversation = [];
     let accumulatedTranscript = '';
     let silenceTimer = null;
     let callStartTime = Date.now();
+    let scenarioLocked = false;
+    let activeScenario = SCENARIO_MAP.price_sensitive_small_business;
+    let llmInFlight = false;
+    let pendingTranscript = '';
+    let interrupted = false; // Barge-in flag: when true, stop sending agent audio chunks.
+    let agentSpeakingState = false; // Track whether agent TTS is in progress.
+    let ttsSessionId = 0; // Increment to invalidate in-flight chunk send loops.
+    let interruptNotified = false; // Ensure we only notify interrupt once per utterance.
+    let callEnded = false;
+
+    function resetConversationForScenario(scenario) {
+      conversation = [
+        {
+          role: 'system',
+          content: scenario.systemPrompt,
+        },
+      ];
+      accumulatedTranscript = '';
+    }
+
+    function startCallWithScenario(scenario) {
+      activeScenario = scenario;
+      scenarioLocked = true;
+      callEnded = false;
+      callStartTime = Date.now();
+      resetConversationForScenario(scenario);
+      console.log(`[scenario] Call started under scenario: ${scenario.name}`);
+    }
+
+    resetConversationForScenario(activeScenario);
 
     async function handleFinalTranscript(transcriptText) {
+      if (callEnded) return;
       const text = (transcriptText || '').trim();
       if (!text) return;
 
@@ -88,6 +181,7 @@ function setupWebsocket(server) {
 
       try {
         const responseText = await llmClient.generate(conversation);
+        if (callEnded) return;
         const safeResponse = responseText || '...';
         conversation.push({ role: 'assistant', content: safeResponse });
         console.log(`[llm] Turn ${turnCount} customer reply: "${safeResponse}"`);
@@ -103,6 +197,11 @@ function setupWebsocket(server) {
         // Generate TTS audio for the agent response.
         try {
           console.log('[tts] Starting speech generation...');
+          if (callEnded) return;
+          interrupted = false; // Reset barge-in flag before starting new utterance.
+          interruptNotified = false;
+          agentSpeakingState = true;
+          const currentTtsSession = ++ttsSessionId;
           ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_START }));
 
           const audioBuffer = await ttsClient.generateSpeech(safeResponse, {
@@ -111,10 +210,16 @@ function setupWebsocket(server) {
           });
 
           // Split audio into chunks for streaming-like experience.
+          // Check interrupted flag before sending each chunk for barge-in support.
           const chunkSize = 4096; // ~256ms chunks at 16kHz PCM16
           let offset = 0;
           let chunkCount = 0;
           while (offset < audioBuffer.length) {
+            // Barge-in: stop sending chunks immediately if user interrupted.
+            if (callEnded || interrupted || currentTtsSession !== ttsSessionId) {
+              console.log(`[tts] Barge-in: cancelled remaining ${Math.ceil((audioBuffer.length - offset) / chunkSize)} chunks`);
+              break;
+            }
             const chunk = audioBuffer.slice(offset, offset + chunkSize);
             ws.send(
               JSON.stringify({
@@ -126,12 +231,25 @@ function setupWebsocket(server) {
             );
             offset += chunkSize;
             chunkCount++;
+            // Yield to event loop so user.interrupt can be processed immediately.
+            await new Promise((resolve) => setTimeout(resolve, 0));
           }
 
-          ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_END }));
-          console.log(`[tts] Sent ${chunkCount} audio chunks`);
+          agentSpeakingState = false;
+          if (callEnded || interrupted || currentTtsSession !== ttsSessionId) {
+            // Notify frontend that agent speech was interrupted.
+            if (!interruptNotified) {
+              ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_INTERRUPT }));
+              interruptNotified = true;
+            }
+            console.log(`[tts] Agent speech interrupted after ${chunkCount} chunks`);
+          } else {
+            ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_END }));
+            console.log(`[tts] Sent ${chunkCount} audio chunks`);
+          }
         } catch (ttsErr) {
           console.error('[tts] Failed to generate speech:', ttsErr.message || ttsErr);
+          agentSpeakingState = false;
           ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_END }));
         }
       } catch (err) {
@@ -142,7 +260,28 @@ function setupWebsocket(server) {
             text: 'The customer is temporarily unavailable. Please try again.',
           })
         );
+      } finally {
+        llmInFlight = false;
+        if (!callEnded && pendingTranscript) {
+          const nextTranscript = pendingTranscript;
+          pendingTranscript = '';
+          // Process queued transcript after current turn finishes.
+          setTimeout(() => {
+            queueTranscript(nextTranscript);
+          }, 0);
+        }
       }
+    }
+
+    function queueTranscript(text) {
+      const cleaned = (text || '').trim();
+      if (!cleaned) return;
+      if (llmInFlight) {
+        pendingTranscript = pendingTranscript ? `${pendingTranscript} ${cleaned}` : cleaned;
+        return;
+      }
+      llmInFlight = true;
+      handleFinalTranscript(cleaned);
     }
     // TODO: Add end-of-call feedback summarization once call termination flow exists.
 
@@ -162,25 +301,23 @@ function setupWebsocket(server) {
       }
       const transcript = transcriptLines.join('\n');
 
-      const feedbackPrompt = `You are a sales coach evaluating a sales training call.
-Analyze the trainee's performance objectively and constructively.
-
-Call transcript:
-${transcript}
-
-Provide feedback in STRICT JSON format with this structure:
-{
-  "overall_score": <number 0-10>,
-  "strengths": [<string>],
-  "weaknesses": [<string>],
-  "objection_handling": <number 0-10>,
-  "communication_clarity": <number 0-10>,
-  "confidence": <number 0-10>,
-  "missed_opportunities": [<string>],
-  "actionable_suggestions": [<string>]
-}
-
-Return ONLY valid JSON. Do not include any explanatory text.`;
+      const feedbackPrompt =
+        'You are a sales coach evaluating a sales training call.\n' +
+        'Analyze the trainee\'s performance objectively and constructively.\n' +
+        `\nScenario: ${activeScenario ? activeScenario.name : 'Unknown'}\n\n` +
+        `Call transcript:\n${transcript}\n\n` +
+        'Provide feedback in STRICT JSON format with this structure:\n' +
+        '{\n' +
+        '  "overall_score": <number 0-10>,\n' +
+        '  "strengths": [<string>],\n' +
+        '  "weaknesses": [<string>],\n' +
+        '  "objection_handling": <number 0-10>,\n' +
+        '  "communication_clarity": <number 0-10>,\n' +
+        '  "confidence": <number 0-10>,\n' +
+        '  "missed_opportunities": [<string>],\n' +
+        '  "actionable_suggestions": [<string>]\n' +
+        '}\n\n' +
+        'Return ONLY valid JSON. Do not include any explanatory text.';
 
       try {
         const feedbackText = await llmClient.generate([
@@ -298,7 +435,26 @@ Return ONLY valid JSON. Do not include any explanatory text.`;
           }
           break;
         }
+        case MESSAGE_TYPES.SCENARIO_SELECT: {
+          if (scenarioLocked) {
+            console.log('[scenario] Selection ignored; scenario already locked for this session');
+            break;
+          }
+          const scenarioId = typeof parsed.scenarioId === 'string' ? parsed.scenarioId : null;
+          const scenario = scenarioId && SCENARIO_MAP[scenarioId];
+          if (!scenario) {
+            console.warn('[scenario] Unknown scenario selection; using default');
+            break;
+          }
+          activeScenario = scenario;
+          resetConversationForScenario(scenario);
+          console.log(`[scenario] Scenario selected: ${scenario.name}`);
+          break;
+        }
         case MESSAGE_TYPES.USER_AUDIO_START: {
+          if (!scenarioLocked) {
+            startCallWithScenario(activeScenario);
+          }
           streamState.active = true;
           streamState.sampleRate = typeof parsed.sampleRate === 'number' ? parsed.sampleRate : null;
           streamState.totalSamples = 0;
@@ -347,14 +503,14 @@ Return ONLY valid JSON. Do not include any explanatory text.`;
                 if (cleaned) {
                   accumulatedTranscript = accumulatedTranscript ? `${accumulatedTranscript} ${cleaned}` : cleaned;
                 }
-                // Clear previous timer and start new 2-second countdown.
+                // Clear previous timer and start new 3-second countdown.
                 if (silenceTimer) clearTimeout(silenceTimer);
                 silenceTimer = setTimeout(() => {
                   silenceTimer = null;
                   if (accumulatedTranscript) {
                     const toSend = accumulatedTranscript;
                     accumulatedTranscript = '';
-                    handleFinalTranscript(toSend);
+                    queueTranscript(toSend);
                   }
                 }, SILENCE_TIMEOUT_MS);
                 break;
@@ -442,7 +598,7 @@ Return ONLY valid JSON. Do not include any explanatory text.`;
           if (accumulatedTranscript) {
             const toSend = accumulatedTranscript;
             accumulatedTranscript = '';
-            handleFinalTranscript(toSend);
+            queueTranscript(toSend);
           }
 
           // Reset state for the next turn.
@@ -462,9 +618,19 @@ Return ONLY valid JSON. Do not include any explanatory text.`;
           console.log('[ws] Agent audio end received (placeholder)');
           break;
         }
-        case MESSAGE_TYPES.AGENT_INTERRUPT: {
-          // TODO: Trigger barge-in behavior to halt agent TTS playback.
-          console.log('[ws] Agent interrupt received (placeholder)');
+        case MESSAGE_TYPES.USER_INTERRUPT: {
+          // Barge-in: user is speaking while agent is playing audio.
+          interrupted = true;
+          ttsSessionId += 1; // Invalidate any in-flight TTS chunk loop.
+          agentSpeakingState = false;
+          console.log('[barge-in] Interruption detected');
+          console.log('[barge-in] Agent speech cancelled');
+
+          // Always notify frontend to stop playback immediately.
+          if (!interruptNotified) {
+            ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_INTERRUPT }));
+            interruptNotified = true;
+          }
           break;
         }
         case MESSAGE_TYPES.AGENT_TEXT: {
@@ -474,7 +640,47 @@ Return ONLY valid JSON. Do not include any explanatory text.`;
         }
         case MESSAGE_TYPES.CALL_END: {
           console.log('[ws] Call end received, generating feedback...');
+          callEnded = true;
+          interrupted = true;
+          ttsSessionId += 1;
+          agentSpeakingState = false;
+          if (!interruptNotified) {
+            ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_INTERRUPT }));
+            interruptNotified = true;
+          }
+          if (deepgramClient) {
+            deepgramClient.close();
+            deepgramClient = null;
+          }
+          if (silenceTimer) {
+            clearTimeout(silenceTimer);
+            silenceTimer = null;
+          }
           generateCallFeedback();
+          break;
+        }
+        case MESSAGE_TYPES.CALL_RESET: {
+          console.log('[ws] Call reset received, clearing session state');
+          callEnded = false;
+          scenarioLocked = false;
+          activeScenario = SCENARIO_MAP.price_sensitive_small_business;
+          resetConversationForScenario(activeScenario);
+          accumulatedTranscript = '';
+          pendingTranscript = '';
+          llmInFlight = false;
+          interrupted = false;
+          ttsSessionId += 1;
+          agentSpeakingState = false;
+          interruptNotified = false;
+          callStartTime = Date.now();
+          if (deepgramClient) {
+            deepgramClient.close();
+            deepgramClient = null;
+          }
+          if (silenceTimer) {
+            clearTimeout(silenceTimer);
+            silenceTimer = null;
+          }
           break;
         }
         default: {
