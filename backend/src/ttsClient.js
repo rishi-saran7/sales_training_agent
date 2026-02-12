@@ -39,6 +39,8 @@ class TtsClient {
         },
       };
 
+      const timeoutMs = 15000;
+
       console.log(`[tts] Generating speech for text: "${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
       const req = https.request(requestOptions, (res) => {
@@ -70,6 +72,10 @@ class TtsClient {
         res.on('error', (err) => {
           reject(err);
         });
+      });
+
+      req.setTimeout(timeoutMs, () => {
+        req.destroy(new Error(`TTS request timed out after ${timeoutMs} ms`));
       });
 
       req.on('error', (err) => {

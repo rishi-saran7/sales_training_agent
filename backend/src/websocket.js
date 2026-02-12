@@ -1,9 +1,17 @@
 const { WebSocketServer } = require('ws');
+const { randomUUID } = require('crypto');
 const { DeepgramClient } = require('./deepgramClient');
 const { LlmClient } = require('./llmClient');
 const { TtsClient } = require('./ttsClient');
+const { supabase } = require('./lib/supabase');
 
 const SILENCE_TIMEOUT_MS = 3000; // Wait 3 seconds after last speech to trigger LLM response.
+const COACH_HINT_COOLDOWN_MS = 10000;
+const COACHING_SYSTEM_PROMPT =
+  'You are a live sales coach.\n' +
+  'Provide a short, actionable suggestion (1 sentence max).\n' +
+  'Only suggest improvements.\n' +
+  'If no suggestion is needed, return null.';
 
 // Message types keep the contract explicit and easy to extend later.
 const MESSAGE_TYPES = {
@@ -22,6 +30,7 @@ const MESSAGE_TYPES = {
   STT_PARTIAL: 'stt.partial',
   STT_FINAL: 'stt.final',
   AGENT_TEXT: 'agent.text',
+  COACH_HINT: 'coach.hint',
   CALL_END: 'call.end',
   CALL_RESET: 'call.reset',
   CALL_FEEDBACK: 'call.feedback',
@@ -139,6 +148,7 @@ function setupWebsocket(server) {
     let accumulatedTranscript = '';
     let silenceTimer = null;
     let callStartTime = Date.now();
+    let sessionId = null;
     let scenarioLocked = false;
     let activeScenario = SCENARIO_MAP.price_sensitive_small_business;
     let llmInFlight = false;
@@ -148,6 +158,8 @@ function setupWebsocket(server) {
     let ttsSessionId = 0; // Increment to invalidate in-flight chunk send loops.
     let interruptNotified = false; // Ensure we only notify interrupt once per utterance.
     let callEnded = false;
+    let coachHintSentForTurn = false;
+    let lastCoachHintAt = 0;
 
     function resetConversationForScenario(scenario) {
       conversation = [
@@ -163,9 +175,67 @@ function setupWebsocket(server) {
       activeScenario = scenario;
       scenarioLocked = true;
       callEnded = false;
+      coachHintSentForTurn = false;
       callStartTime = Date.now();
+      sessionId = randomUUID();
       resetConversationForScenario(scenario);
       console.log(`[scenario] Call started under scenario: ${scenario.name}`);
+    }
+
+    // TODO: Add advanced scoring engine to enrich hint quality.
+    // TODO: Add hint personalization based on trainee profile.
+    // TODO: Tune hint frequency by difficulty level.
+    async function generateCoachHint(latestText) {
+      if (callEnded) return;
+      if (!latestText) return;
+      if (coachHintSentForTurn) return;
+
+      const now = Date.now();
+      if (now - lastCoachHintAt < COACH_HINT_COOLDOWN_MS) {
+        console.log('[coach] Hint skipped (cooldown)');
+        coachHintSentForTurn = true;
+        return;
+      }
+
+      coachHintSentForTurn = true;
+      lastCoachHintAt = now;
+
+      const recentMessages = conversation
+        .filter((msg) => msg.role !== 'system')
+        .slice(-4)
+        .map((msg) => `${msg.role === 'user' ? 'Trainee' : 'Customer'}: ${msg.content}`)
+        .join('\n');
+
+      const contextBlock = recentMessages || 'No prior messages.';
+      const scenarioLabel = activeScenario ? activeScenario.name : 'Unknown';
+      const coachPrompt =
+        `Scenario: ${scenarioLabel}\n` +
+        `Recent conversation:\n${contextBlock}\n\n` +
+        `Latest trainee statement: "${latestText}"\n` +
+        'Return one short suggestion or null.';
+
+      try {
+        const hintText = await llmClient.generate([
+          { role: 'system', content: COACHING_SYSTEM_PROMPT },
+          { role: 'user', content: coachPrompt },
+        ]);
+
+        const cleaned = (hintText || '').trim();
+        if (!cleaned || /^null$/i.test(cleaned) || /^none$/i.test(cleaned)) {
+          console.log('[coach] Hint skipped (none)');
+          return;
+        }
+
+        ws.send(
+          JSON.stringify({
+            type: MESSAGE_TYPES.COACH_HINT,
+            text: cleaned,
+          })
+        );
+        console.log('[coach] Coaching hint generated');
+      } catch (err) {
+        console.log('[coach] Hint skipped (error)');
+      }
     }
 
     resetConversationForScenario(activeScenario);
@@ -202,12 +272,21 @@ function setupWebsocket(server) {
           interruptNotified = false;
           agentSpeakingState = true;
           const currentTtsSession = ++ttsSessionId;
-          ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_START }));
+          let ttsStarted = false;
 
           const audioBuffer = await ttsClient.generateSpeech(safeResponse, {
             encoding: 'linear16',
             sampleRate: 16000,
           });
+
+          if (!audioBuffer || audioBuffer.length === 0) {
+            console.warn('[tts] Generated empty audio buffer; skipping playback');
+            agentSpeakingState = false;
+            return;
+          }
+
+          ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_START }));
+          ttsStarted = true;
 
           // Split audio into chunks for streaming-like experience.
           // Check interrupted flag before sending each chunk for barge-in support.
@@ -243,7 +322,7 @@ function setupWebsocket(server) {
               interruptNotified = true;
             }
             console.log(`[tts] Agent speech interrupted after ${chunkCount} chunks`);
-          } else {
+          } else if (ttsStarted) {
             ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_END }));
             console.log(`[tts] Sent ${chunkCount} audio chunks`);
           }
@@ -361,6 +440,28 @@ function setupWebsocket(server) {
             turnCount,
           })
         );
+
+        if (supabase && sessionId) {
+          supabase
+            .from('call_sessions')
+            .insert({
+              session_id: sessionId,
+              scenario: activeScenario ? activeScenario.name : 'Unknown',
+              call_duration: callDurationMs,
+              transcript,
+              feedback: feedbackData,
+            })
+            .then(({ error }) => {
+              if (error) {
+                console.error('[supabase] Failed to save session:', error.message || error);
+                return;
+              }
+              console.log('[supabase] Session saved successfully');
+            })
+            .catch((error) => {
+              console.error('[supabase] Failed to save session:', error.message || error);
+            });
+        }
       } catch (err) {
         console.error('[feedback] Failed to generate feedback:', err.message || err);
         ws.send(
@@ -455,6 +556,7 @@ function setupWebsocket(server) {
           if (!scenarioLocked) {
             startCallWithScenario(activeScenario);
           }
+          coachHintSentForTurn = false;
           streamState.active = true;
           streamState.sampleRate = typeof parsed.sampleRate === 'number' ? parsed.sampleRate : null;
           streamState.totalSamples = 0;
@@ -502,6 +604,7 @@ function setupWebsocket(server) {
                 const cleaned = (data.text || '').trim();
                 if (cleaned) {
                   accumulatedTranscript = accumulatedTranscript ? `${accumulatedTranscript} ${cleaned}` : cleaned;
+                  generateCoachHint(accumulatedTranscript);
                 }
                 // Clear previous timer and start new 3-second countdown.
                 if (silenceTimer) clearTimeout(silenceTimer);
@@ -511,6 +614,7 @@ function setupWebsocket(server) {
                     const toSend = accumulatedTranscript;
                     accumulatedTranscript = '';
                     queueTranscript(toSend);
+                    coachHintSentForTurn = false;
                   }
                 }, SILENCE_TIMEOUT_MS);
                 break;
@@ -599,6 +703,7 @@ function setupWebsocket(server) {
             const toSend = accumulatedTranscript;
             accumulatedTranscript = '';
             queueTranscript(toSend);
+            coachHintSentForTurn = false;
           }
 
           // Reset state for the next turn.
@@ -665,6 +770,9 @@ function setupWebsocket(server) {
           scenarioLocked = false;
           activeScenario = SCENARIO_MAP.price_sensitive_small_business;
           resetConversationForScenario(activeScenario);
+          sessionId = null;
+          coachHintSentForTurn = false;
+          lastCoachHintAt = 0;
           accumulatedTranscript = '';
           pendingTranscript = '';
           llmInFlight = false;
