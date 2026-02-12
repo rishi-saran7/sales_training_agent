@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 type ConnectionStatus = "connecting" | "connected" | "disconnected";
@@ -23,6 +24,7 @@ const MESSAGE_TYPES = {
   STT_PARTIAL: "stt.partial",
   STT_FINAL: "stt.final",
   AGENT_TEXT: "agent.text",
+  COACH_HINT: "coach.hint",
   CALL_END: "call.end",
   CALL_RESET: "call.reset",
   CALL_FEEDBACK: "call.feedback",
@@ -42,6 +44,14 @@ type FeedbackPayload = {
   actionable_suggestions: string[];
 };
 
+type PastSession = {
+  id: number | string;
+  scenario: string;
+  call_duration: number;
+  overall_score: number | string | null;
+  created_at: string;
+};
+
 type AgentMessage =
   | { type: typeof MESSAGE_TYPES.AGENT_CONNECTED; message: string }
   | { type: typeof MESSAGE_TYPES.PING; timestamp: number }
@@ -57,6 +67,7 @@ type AgentMessage =
   | { type: typeof MESSAGE_TYPES.STT_PARTIAL; text: string }
   | { type: typeof MESSAGE_TYPES.STT_FINAL; text: string }
   | { type: typeof MESSAGE_TYPES.AGENT_TEXT; text: string }
+  | { type: typeof MESSAGE_TYPES.COACH_HINT; text: string }
   | { type: typeof MESSAGE_TYPES.CALL_FEEDBACK; payload: FeedbackPayload; callDurationMs: number; turnCount: number }
   | { type: string; [key: string]: unknown };
 
@@ -121,6 +132,14 @@ export default function HomePage() {
   const [callMetrics, setCallMetrics] = useState<{ duration: number; turns: number } | null>(null);
   const [scenarioId, setScenarioId] = useState<string>(SCENARIOS[0]?.id || "");
   const [scenarioLocked, setScenarioLocked] = useState<boolean>(false);
+  const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
+  const [sessionsLoading, setSessionsLoading] = useState<boolean>(false);
+  const [sessionsError, setSessionsError] = useState<string>("");
+  const [sessionsVisible, setSessionsVisible] = useState<boolean>(false);
+  const [audioEnabled, setAudioEnabled] = useState<boolean>(false);
+  const [coachHint, setCoachHint] = useState<string>("");
+  const [coachHintVisible, setCoachHintVisible] = useState<boolean>(false);
+  const [coachHintsEnabled, setCoachHintsEnabled] = useState<boolean>(true);
 
   const recordingRef = useRef<RecordingHandles | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -134,11 +153,13 @@ export default function HomePage() {
   const bargeInHitCountRef = useRef<number>(0); // Count consecutive frames over threshold.
   const bargeInTriggeredRef = useRef<boolean>(false); // Track if barge-in actually fired for this utterance.
   const bargeInEnableAtRef = useRef<number>(0); // Timestamp after which barge-in is allowed for this utterance.
+  const coachHintTimerRef = useRef<number | null>(null);
+  const coachHintsEnabledRef = useRef<boolean>(true);
 
   // TODO: Adaptive interruption thresholds — adjust BARGE_IN_ENERGY_THRESHOLD based on ambient noise levels.
-  const BARGE_IN_ENERGY_THRESHOLD = 0.02; // RMS energy threshold to detect user speech during agent playback.
-  const BARGE_IN_HITS_REQUIRED = 3; // Require consecutive frames over threshold to trigger barge-in.
-  const BARGE_IN_GRACE_MS = 300; // Short grace window to avoid false triggers on agent start.
+  const BARGE_IN_ENERGY_THRESHOLD = 0.035; // RMS energy threshold to detect user speech during agent playback.
+  const BARGE_IN_HITS_REQUIRED = 4; // Require consecutive frames over threshold to trigger barge-in.
+  const BARGE_IN_GRACE_MS = 500; // Short grace window to avoid false triggers on agent start.
 
   function isAgentAudioActive() {
     return agentSpeakingRef.current || isPlayingRef.current || audioQueueRef.current.length > 0;
@@ -229,6 +250,10 @@ export default function HomePage() {
   }
 
   useEffect(() => {
+    coachHintsEnabledRef.current = coachHintsEnabled;
+  }, [coachHintsEnabled]);
+
+  useEffect(() => {
     // Establish the live WebSocket link to the backend agent gateway.
     const socket = new WebSocket(WS_URL);
     socketRef.current = socket;
@@ -296,6 +321,7 @@ export default function HomePage() {
         case MESSAGE_TYPES.AGENT_AUDIO_START: {
           setAgentSpeaking(true);
           agentSpeakingRef.current = true;
+          ensurePlaybackContextReady();
           ignoreAgentAudioRef.current = false;
           bargeInCooldownRef.current = false;
           bargeInHitCountRef.current = 0;
@@ -315,6 +341,7 @@ export default function HomePage() {
           }
           if (typeof parsed.payload === "string" && typeof parsed.sampleRate === "number") {
             try {
+              ensurePlaybackContextReady();
               console.log(`[audio] Received chunk: ${parsed.payload.length} chars, ${parsed.sampleRate}Hz`);
               const floats = base64ToFloat32Array(parsed.payload, parsed.sampleRate);
               console.log(`[audio] Decoded ${floats.length} samples`);
@@ -338,6 +365,10 @@ export default function HomePage() {
         case MESSAGE_TYPES.AGENT_AUDIO_END: {
           console.log("Agent audio end received");
           // Playback may still continue from buffered chunks; keep agentSpeakingRef true until queue drains.
+          if (!isPlayingRef.current && audioQueueRef.current.length === 0) {
+            setAgentSpeaking(false);
+            agentSpeakingRef.current = false;
+          }
           break;
         }
         case MESSAGE_TYPES.AGENT_INTERRUPT: {
@@ -371,6 +402,12 @@ export default function HomePage() {
           }
           break;
         }
+        case MESSAGE_TYPES.COACH_HINT: {
+          if (coachHintsEnabledRef.current && typeof parsed.text === "string") {
+            showCoachHint(parsed.text);
+          }
+          break;
+        }
         case MESSAGE_TYPES.CALL_FEEDBACK: {
           if (parsed.payload && typeof parsed.payload === "object") {
             setFeedback(parsed.payload as FeedbackPayload);
@@ -379,6 +416,7 @@ export default function HomePage() {
               turns: typeof parsed.turnCount === "number" ? parsed.turnCount : 0,
             });
             setCallEnded(true);
+            clearCoachHint();
             console.log("Call feedback received", parsed.payload);
           }
           break;
@@ -407,6 +445,88 @@ export default function HomePage() {
     return btoa(binary);
   }
 
+  function clearCoachHint() {
+    setCoachHintVisible(false);
+    setCoachHint("");
+    if (coachHintTimerRef.current) {
+      window.clearTimeout(coachHintTimerRef.current);
+      coachHintTimerRef.current = null;
+    }
+  }
+
+  function showCoachHint(text: string) {
+    if (!coachHintsEnabled) return;
+    setCoachHint(text);
+    setCoachHintVisible(true);
+    if (coachHintTimerRef.current) {
+      window.clearTimeout(coachHintTimerRef.current);
+    }
+    coachHintTimerRef.current = window.setTimeout(() => {
+      setCoachHintVisible(false);
+    }, 8000);
+  }
+
+  function ensurePlaybackContextReady() {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    if (audioContextRef.current.state === "suspended") {
+      audioContextRef.current.resume().catch(() => {
+        console.warn("[audio] Failed to resume playback context");
+      });
+    }
+  }
+
+  function toggleCoachHints() {
+    setCoachHintsEnabled((prev) => {
+      const next = !prev;
+      if (!next) {
+        clearCoachHint();
+      }
+      return next;
+    });
+  }
+
+  async function enableAudio() {
+    if (!audioContextRef.current) {
+      audioContextRef.current = new AudioContext();
+    }
+    if (audioContextRef.current.state === "suspended") {
+      await audioContextRef.current.resume();
+    }
+    setAudioEnabled(true);
+    console.log("[audio] Playback AudioContext enabled");
+  }
+
+  function formatDuration(durationMs: number) {
+    const totalSeconds = Math.max(0, Math.round(durationMs / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return minutes > 0 ? `${minutes}m ${seconds}s` : `${seconds}s`;
+  }
+
+  async function loadPastSessions() {
+    if (sessionsLoading) return;
+    setSessionsLoading(true);
+    setSessionsError("");
+
+    try {
+      const response = await fetch("http://localhost:3001/api/sessions");
+      if (!response.ok) {
+        throw new Error(`Request failed with ${response.status}`);
+      }
+      const data = await response.json();
+      const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+      setPastSessions(sessions);
+      setSessionsVisible(true);
+    } catch (err) {
+      console.error("Failed to load sessions", err);
+      setSessionsError("Failed to load sessions");
+    } finally {
+      setSessionsLoading(false);
+    }
+  }
+
   async function startRecording(options: StartRecordingOptions = {}) {
     const { allowImmediateInterrupt = true } = options;
     if (micStatus === "recording") return;
@@ -414,6 +534,8 @@ export default function HomePage() {
       console.warn("Socket not ready; cannot start recording");
       return;
     }
+
+    await enableAudio();
 
     if (!scenarioLocked && activeScenario) {
       socketRef.current.send(
@@ -587,6 +709,7 @@ export default function HomePage() {
     setPartialTranscript("");
     setAgentSpeaking(false);
     setScenarioLocked(false);
+    clearCoachHint();
     socketRef.current?.send(JSON.stringify({ type: MESSAGE_TYPES.CALL_RESET }));
     console.log("Call reset");
   }
@@ -763,6 +886,78 @@ export default function HomePage() {
             Latency: ~{latency} ms
           </p>
         )}
+        <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+          <Link
+            href="/analytics"
+            style={{
+              display: "inline-flex",
+              alignItems: "center",
+              gap: "0.4rem",
+              padding: "0.45rem 0.85rem",
+              borderRadius: "999px",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "rgba(14, 165, 233, 0.15)",
+              color: "#e8eef5",
+              textDecoration: "none",
+              fontSize: "0.85rem",
+              fontWeight: 600,
+            }}
+          >
+            View Analytics
+          </Link>
+          {!audioEnabled && (
+            <button
+              onClick={enableAudio}
+              style={{
+                padding: "0.45rem 0.85rem",
+                borderRadius: "999px",
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "rgba(148, 163, 184, 0.15)",
+                color: "#e8eef5",
+                cursor: "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
+            >
+              Enable Audio
+            </button>
+          )}
+          <button
+            onClick={toggleCoachHints}
+            style={{
+              padding: "0.45rem 0.85rem",
+              borderRadius: "999px",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: coachHintsEnabled ? "rgba(16, 185, 129, 0.2)" : "rgba(148, 163, 184, 0.15)",
+              color: "#e8eef5",
+              cursor: "pointer",
+              fontSize: "0.85rem",
+              fontWeight: 600,
+            }}
+          >
+            {coachHintsEnabled ? "Coach Hints: On" : "Coach Hints: Off"}
+          </button>
+        </div>
+        <div style={{ marginTop: "1rem", display: "flex", gap: "0.75rem", alignItems: "center" }}>
+          <button
+            onClick={loadPastSessions}
+            disabled={sessionsLoading}
+            style={{
+              padding: "0.6rem 1rem",
+              borderRadius: "10px",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: sessionsLoading ? "#4b5563" : "#0ea5e9",
+              color: "white",
+              cursor: sessionsLoading ? "not-allowed" : "pointer",
+              fontWeight: 600,
+            }}
+          >
+            {sessionsLoading ? "Loading Sessions..." : "View Past Sessions"}
+          </button>
+          {sessionsError && (
+            <span style={{ fontSize: "0.85rem", color: "#fca5a5" }}>{sessionsError}</span>
+          )}
+        </div>
         <div style={{ marginTop: "1rem" }}>
           <label style={{ display: "block", fontSize: "0.85rem", opacity: 0.8, marginBottom: "0.35rem" }}>
             Scenario Selection
@@ -890,6 +1085,84 @@ export default function HomePage() {
             </div>
           )}
         </div>
+
+        {coachHintVisible && coachHint && (
+          <div
+            style={{
+              position: "fixed",
+              right: "2rem",
+              bottom: "2rem",
+              maxWidth: "320px",
+              padding: "1rem 1.1rem",
+              borderRadius: "14px",
+              background: "rgba(15, 23, 42, 0.92)",
+              border: "1px solid rgba(56, 189, 248, 0.4)",
+              boxShadow: "0 12px 24px rgba(0, 0, 0, 0.35)",
+              zIndex: 20,
+            }}
+          >
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+              <p style={{ margin: 0, fontSize: "0.85rem", letterSpacing: "0.08em", textTransform: "uppercase" }}>
+                Coach Hint
+              </p>
+              <button
+                onClick={clearCoachHint}
+                style={{
+                  border: "none",
+                  background: "transparent",
+                  color: "#94a3b8",
+                  cursor: "pointer",
+                  fontSize: "0.9rem",
+                }}
+                aria-label="Dismiss hint"
+              >
+                ×
+              </button>
+            </div>
+            <p style={{ margin: "0.5rem 0 0", fontSize: "0.95rem", lineHeight: 1.5, color: "#e2e8f0" }}>
+              {coachHint}
+            </p>
+          </div>
+        )}
+
+        {/* TODO: Add pagination for session history. */}
+        {/* TODO: Add session detail view with transcript and feedback. */}
+        {/* TODO: Add analytics dashboard for aggregate coaching metrics. */}
+        {sessionsVisible && (
+          <div style={{ marginTop: "1.75rem" }}>
+            <h3 style={{ margin: "0 0 0.75rem", fontSize: "1.2rem" }}>Past Sessions</h3>
+            {pastSessions.length === 0 ? (
+              <p style={{ margin: 0, opacity: 0.75 }}>No sessions yet.</p>
+            ) : (
+              <div style={{ display: "grid", gap: "0.65rem" }}>
+                {pastSessions.map((session) => (
+                  <div
+                    key={session.id}
+                    style={{
+                      padding: "0.85rem 1rem",
+                      background: "rgba(255,255,255,0.05)",
+                      borderRadius: "10px",
+                      border: "1px solid rgba(255,255,255,0.08)",
+                    }}
+                  >
+                    <p style={{ margin: 0, fontSize: "0.95rem", fontWeight: 600 }}>
+                      {session.scenario}
+                    </p>
+                    <p style={{ margin: "0.35rem 0 0", fontSize: "0.85rem", opacity: 0.8 }}>
+                      Overall Score: {session.overall_score ?? "N/A"}
+                    </p>
+                    <p style={{ margin: "0.25rem 0 0", fontSize: "0.85rem", opacity: 0.8 }}>
+                      Duration: {formatDuration(Number(session.call_duration) || 0)}
+                    </p>
+                    <p style={{ margin: "0.25rem 0 0", fontSize: "0.85rem", opacity: 0.8 }}>
+                      Date: {session.created_at ? new Date(session.created_at).toLocaleString() : "Unknown"}
+                    </p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        )}
       </div>
       )}
     </main>
