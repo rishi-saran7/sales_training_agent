@@ -16,6 +16,7 @@ const COACHING_SYSTEM_PROMPT =
 // Message types keep the contract explicit and easy to extend later.
 const MESSAGE_TYPES = {
   AGENT_CONNECTED: 'agent_connected',
+  AUTH: 'auth',
   PING: 'ping',
   PONG: 'pong',
   SCENARIO_SELECT: 'scenario.select',
@@ -160,6 +161,7 @@ function setupWebsocket(server) {
     let callEnded = false;
     let coachHintSentForTurn = false;
     let lastCoachHintAt = 0;
+    let currentUserId = null;
 
     function resetConversationForScenario(scenario) {
       conversation = [
@@ -441,11 +443,12 @@ function setupWebsocket(server) {
           })
         );
 
-        if (supabase && sessionId) {
+        if (supabase && sessionId && currentUserId) {
           supabase
             .from('call_sessions')
             .insert({
               session_id: sessionId,
+              user_id: currentUserId,
               scenario: activeScenario ? activeScenario.name : 'Unknown',
               call_duration: callDurationMs,
               transcript,
@@ -461,6 +464,8 @@ function setupWebsocket(server) {
             .catch((error) => {
               console.error('[supabase] Failed to save session:', error.message || error);
             });
+        } else if (!currentUserId) {
+          console.log('[supabase] Session not saved (unauthenticated user)');
         }
       } catch (err) {
         console.error('[feedback] Failed to generate feedback:', err.message || err);
@@ -514,6 +519,7 @@ function setupWebsocket(server) {
         deepgramClient.close();
         deepgramClient = null;
       }
+      currentUserId = null;
       console.log(`[ws] Client disconnected${clientAddress ? ` from ${clientAddress}` : ''}`);
     });
 
@@ -526,6 +532,31 @@ function setupWebsocket(server) {
       }
 
       switch (parsed.type) {
+        case MESSAGE_TYPES.AUTH: {
+          if (!supabase) {
+            console.warn('[auth] Supabase not configured');
+            break;
+          }
+          const token = typeof parsed.token === 'string' ? parsed.token : null;
+          if (!token) {
+            console.warn('[auth] Missing token');
+            break;
+          }
+          supabase.auth
+            .getUser(token)
+            .then(({ data, error }) => {
+              if (error || !data?.user) {
+                console.warn('[auth] Invalid token');
+                return;
+              }
+              currentUserId = data.user.id;
+              console.log('[auth] User authenticated for session');
+            })
+            .catch(() => {
+              console.warn('[auth] Token verification failed');
+            });
+          break;
+        }
         case MESSAGE_TYPES.PONG: {
           // Compute round-trip latency using the original ping timestamp from the client.
           if (typeof parsed.timestamp === 'number') {

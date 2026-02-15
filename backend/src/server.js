@@ -14,6 +14,32 @@ const app = express();
 // Allow the Next.js dev server to reach this API. Adjust origins when deploying.
 app.use(cors({ origin: 'http://localhost:3000' }));
 
+async function requireUser(req, res) {
+  if (!supabase) {
+    res.status(500).json({ error: 'Supabase is not configured' });
+    return null;
+  }
+
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : null;
+  if (!token) {
+    res.status(401).json({ error: 'Missing auth token' });
+    return null;
+  }
+
+  try {
+    const { data, error } = await supabase.auth.getUser(token);
+    if (error || !data?.user) {
+      res.status(401).json({ error: 'Invalid auth token' });
+      return null;
+    }
+    return data.user;
+  } catch (err) {
+    res.status(401).json({ error: 'Invalid auth token' });
+    return null;
+  }
+}
+
 // Lightweight health check so we can quickly verify the HTTP layer is alive.
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
@@ -21,16 +47,15 @@ app.get('/health', (_req, res) => {
 
 // TODO: Add authentication + RLS enforcement for session access.
 // TODO: Add pagination support for session history.
-app.get('/api/sessions', async (_req, res) => {
-  if (!supabase) {
-    res.status(500).json({ error: 'Supabase is not configured' });
-    return;
-  }
+app.get('/api/sessions', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
 
   try {
     const { data, error } = await supabase
       .from('call_sessions')
       .select('id, scenario, call_duration, overall_score:feedback->>overall_score, created_at')
+      .eq('user_id', user.id)
       .order('created_at', { ascending: false })
       .limit(50);
 
@@ -50,11 +75,9 @@ app.get('/api/sessions', async (_req, res) => {
 // TODO: Add multi-user filtering for analytics.
 // TODO: Add trainer dashboard aggregation layer.
 // TODO: Add export reports (PDF/CSV).
-app.get('/api/analytics', async (_req, res) => {
-  if (!supabase) {
-    res.status(500).json({ error: 'Supabase is not configured' });
-    return;
-  }
+app.get('/api/analytics', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
 
   try {
     const { data, error } = await supabase
@@ -62,6 +85,7 @@ app.get('/api/analytics', async (_req, res) => {
       .select(
         'scenario, created_at, overall_score:feedback->>overall_score, objection_handling:feedback->>objection_handling, communication_clarity:feedback->>communication_clarity, confidence:feedback->>confidence'
       )
+      .eq('user_id', user.id)
       .order('created_at', { ascending: true })
       .limit(500);
 
