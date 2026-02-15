@@ -1,7 +1,9 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
+import { supabase } from "../lib/supabaseClient";
 
 type ConnectionStatus = "connecting" | "connected" | "disconnected";
 
@@ -10,6 +12,7 @@ type MicStatus = "idle" | "recording" | "error";
 // Message types keep the browser <-> server contract explicit.
 const MESSAGE_TYPES = {
   AGENT_CONNECTED: "agent_connected",
+  AUTH: "auth",
   PING: "ping",
   PONG: "pong",
   SCENARIO_SELECT: "scenario.select",
@@ -121,6 +124,7 @@ type StartRecordingOptions = {
 };
 
 export default function HomePage() {
+  const router = useRouter();
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [latency, setLatency] = useState<number | null>(null);
   const [micStatus, setMicStatus] = useState<MicStatus>("idle");
@@ -140,6 +144,8 @@ export default function HomePage() {
   const [coachHint, setCoachHint] = useState<string>("");
   const [coachHintVisible, setCoachHintVisible] = useState<boolean>(false);
   const [coachHintsEnabled, setCoachHintsEnabled] = useState<boolean>(true);
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [authEmail, setAuthEmail] = useState<string>("");
 
   const recordingRef = useRef<RecordingHandles | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -155,6 +161,7 @@ export default function HomePage() {
   const bargeInEnableAtRef = useRef<number>(0); // Timestamp after which barge-in is allowed for this utterance.
   const coachHintTimerRef = useRef<number | null>(null);
   const coachHintsEnabledRef = useRef<boolean>(true);
+  const authTokenRef = useRef<string>("");
 
   // TODO: Adaptive interruption thresholds — adjust BARGE_IN_ENERGY_THRESHOLD based on ambient noise levels.
   const BARGE_IN_ENERGY_THRESHOLD = 0.035; // RMS energy threshold to detect user speech during agent playback.
@@ -253,6 +260,52 @@ export default function HomePage() {
     coachHintsEnabledRef.current = coachHintsEnabled;
   }, [coachHintsEnabled]);
 
+  function sendAuthToken(token: string) {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+    socketRef.current.send(
+      JSON.stringify({
+        type: MESSAGE_TYPES.AUTH,
+        token,
+      })
+    );
+  }
+
+  useEffect(() => {
+    let active = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return;
+      const session = data.session;
+      if (!session) {
+        setAuthLoading(false);
+        router.push("/login");
+        return;
+      }
+      authTokenRef.current = session.access_token;
+      setAuthEmail(session.user.email || "");
+      sendAuthToken(session.access_token);
+      setAuthLoading(false);
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session) {
+        authTokenRef.current = "";
+        setAuthLoading(false);
+        router.push("/login");
+        return;
+      }
+      authTokenRef.current = session.access_token;
+      setAuthEmail(session.user.email || "");
+      sendAuthToken(session.access_token);
+      setAuthLoading(false);
+    });
+
+    return () => {
+      active = false;
+      authListener?.subscription.unsubscribe();
+    };
+  }, [router]);
+
   useEffect(() => {
     // Establish the live WebSocket link to the backend agent gateway.
     const socket = new WebSocket(WS_URL);
@@ -260,6 +313,9 @@ export default function HomePage() {
 
     socket.onopen = () => {
       setStatus("connected");
+      if (authTokenRef.current) {
+        sendAuthToken(authTokenRef.current);
+      }
     };
 
     socket.onclose = () => {
@@ -487,6 +543,11 @@ export default function HomePage() {
     });
   }
 
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    router.push("/login");
+  }
+
   async function enableAudio() {
     if (!audioContextRef.current) {
       audioContextRef.current = new AudioContext();
@@ -510,8 +571,17 @@ export default function HomePage() {
     setSessionsLoading(true);
     setSessionsError("");
 
+    if (!authTokenRef.current) {
+      router.push("/login");
+      return;
+    }
+
     try {
-      const response = await fetch("http://localhost:3001/api/sessions");
+      const response = await fetch("http://localhost:3001/api/sessions", {
+        headers: {
+          Authorization: `Bearer ${authTokenRef.current}`,
+        },
+      });
       if (!response.ok) {
         throw new Error(`Request failed with ${response.status}`);
       }
@@ -629,6 +699,9 @@ export default function HomePage() {
       };
 
       // Notify backend that a user utterance is beginning.
+      if (authTokenRef.current) {
+        sendAuthToken(authTokenRef.current);
+      }
       socketRef.current.send(
         JSON.stringify({
           type: MESSAGE_TYPES.USER_AUDIO_START,
@@ -695,6 +768,9 @@ export default function HomePage() {
       stopRecording();
     }
     stopAgentPlayback();
+    if (authTokenRef.current) {
+      sendAuthToken(authTokenRef.current);
+    }
     // Request feedback from backend.
     socketRef.current?.send(JSON.stringify({ type: MESSAGE_TYPES.CALL_END }));
     console.log("End call requested");
@@ -719,6 +795,24 @@ export default function HomePage() {
     if (status === "disconnected") return "Connection lost";
     return "Connecting...";
   })();
+
+  if (authLoading) {
+    return (
+      <main
+        style={{
+          minHeight: "100vh",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          background: "linear-gradient(135deg, #0c1b33, #0f2740)",
+          color: "#e8eef5",
+          fontFamily: "'IBM Plex Sans', system-ui, -apple-system, sans-serif",
+        }}
+      >
+        Loading...
+      </main>
+    );
+  }
 
   return (
     <main
@@ -886,7 +980,7 @@ export default function HomePage() {
             Latency: ~{latency} ms
           </p>
         )}
-        <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+        <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.75rem", flexWrap: "wrap", alignItems: "center" }}>
           <Link
             href="/analytics"
             style={{
@@ -937,6 +1031,24 @@ export default function HomePage() {
           >
             {coachHintsEnabled ? "Coach Hints: On" : "Coach Hints: Off"}
           </button>
+          <button
+            onClick={handleLogout}
+            style={{
+              padding: "0.45rem 0.85rem",
+              borderRadius: "999px",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: "rgba(239, 68, 68, 0.2)",
+              color: "#e8eef5",
+              cursor: "pointer",
+              fontSize: "0.85rem",
+              fontWeight: 600,
+            }}
+          >
+            Log Out
+          </button>
+          {authEmail && (
+            <span style={{ fontSize: "0.8rem", opacity: 0.75 }}>{authEmail}</span>
+          )}
         </div>
         <div style={{ marginTop: "1rem", display: "flex", gap: "0.75rem", alignItems: "center" }}>
           <button

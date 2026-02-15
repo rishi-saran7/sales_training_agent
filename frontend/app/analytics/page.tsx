@@ -2,6 +2,8 @@
 
 import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { supabase } from "../../lib/supabaseClient";
 import {
   Bar,
   BarChart,
@@ -48,19 +50,56 @@ type AnalyticsResponse = {
 const API_BASE = "http://localhost:3001";
 
 export default function AnalyticsPage() {
+  const router = useRouter();
   const [data, setData] = useState<AnalyticsResponse | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string>("");
+  const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [authEmail, setAuthEmail] = useState<string>("");
+  const [authToken, setAuthToken] = useState<string>("");
 
   useEffect(() => {
     let active = true;
 
+    supabase.auth.getSession().then(({ data: authData }) => {
+      if (!active) return;
+      const session = authData.session;
+      if (!session) {
+        setAuthLoading(false);
+        router.push("/login");
+        return;
+      }
+      setAuthEmail(session.user.email || "");
+      setAuthToken(session.access_token);
+      setAuthLoading(false);
+    });
+
+    const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!session) {
+        setAuthToken("");
+        setAuthLoading(false);
+        router.push("/login");
+        return;
+      }
+      setAuthEmail(session.user.email || "");
+      setAuthToken(session.access_token);
+      setAuthLoading(false);
+    });
+
     async function fetchAnalytics() {
+      if (!authToken) {
+        setLoading(false);
+        return;
+      }
       setLoading(true);
       setError("");
 
       try {
-        const response = await fetch(`${API_BASE}/api/analytics`);
+        const response = await fetch(`${API_BASE}/api/analytics`, {
+          headers: {
+            Authorization: `Bearer ${authToken}`,
+          },
+        });
         if (!response.ok) {
           throw new Error(`Request failed with ${response.status}`);
         }
@@ -84,8 +123,14 @@ export default function AnalyticsPage() {
 
     return () => {
       active = false;
+      authListener?.subscription.unsubscribe();
     };
-  }, []);
+  }, [authToken, router]);
+
+  async function handleLogout() {
+    await supabase.auth.signOut();
+    router.push("/login");
+  }
 
   const trendData = useMemo(() => {
     if (!data?.trend) return [];
@@ -118,6 +163,22 @@ export default function AnalyticsPage() {
 
   const summary = data?.summary;
   const hasData = summary && summary.totalSessions > 0;
+
+  if (authLoading) {
+    return (
+      <main
+        style={{
+          minHeight: "100vh",
+          padding: "3rem 2rem",
+          background: "linear-gradient(135deg, #0b1220, #12203a)",
+          color: "#e2e8f0",
+          fontFamily: "'IBM Plex Sans', system-ui, -apple-system, sans-serif",
+        }}
+      >
+        Loading...
+      </main>
+    );
+  }
 
   return (
     <main
@@ -167,6 +228,25 @@ export default function AnalyticsPage() {
             >
               Back to Call
             </Link>
+            <button
+              onClick={handleLogout}
+              style={{
+                marginLeft: "0.75rem",
+                padding: "0.45rem 0.85rem",
+                borderRadius: "999px",
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "rgba(239, 68, 68, 0.2)",
+                color: "#e2e8f0",
+                cursor: "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
+            >
+              Log Out
+            </button>
+            {authEmail && (
+              <span style={{ marginLeft: "0.75rem", fontSize: "0.8rem", opacity: 0.75 }}>{authEmail}</span>
+            )}
           </div>
         </header>
 
