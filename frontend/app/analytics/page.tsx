@@ -47,6 +47,21 @@ type AnalyticsResponse = {
   byScenario: AnalyticsScenario[];
 };
 
+type TeamMember = {
+  user_id: string;
+  email: string;
+  avgOverallScore: number;
+  avgObjectionHandling: number;
+  avgCommunicationClarity: number;
+  avgConfidence: number;
+  sessionCount: number;
+};
+
+type UnassignedUser = {
+  user_id: string;
+  email: string;
+};
+
 const API_BASE = "http://localhost:3001";
 
 export default function AnalyticsPage() {
@@ -57,6 +72,14 @@ export default function AnalyticsPage() {
   const [authLoading, setAuthLoading] = useState<boolean>(true);
   const [authEmail, setAuthEmail] = useState<string>("");
   const [authToken, setAuthToken] = useState<string>("");
+  const [role, setRole] = useState<string>("");
+  const [organizationName, setOrganizationName] = useState<string>("");
+  const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
+  const [unassignedUsers, setUnassignedUsers] = useState<UnassignedUser[]>([]);
+  const [inviteEmail, setInviteEmail] = useState<string>("");
+  const [inviteLoading, setInviteLoading] = useState<boolean>(false);
+  const [teamLoading, setTeamLoading] = useState<boolean>(false);
+  const [teamError, setTeamError] = useState<string>("");
 
   useEffect(() => {
     let active = true;
@@ -95,6 +118,15 @@ export default function AnalyticsPage() {
       setError("");
 
       try {
+        const orgInfo = await fetchOrgInfo(authToken);
+        setRole(orgInfo.role || "");
+        setOrganizationName(orgInfo.organizationName || "");
+        if (orgInfo.role === "trainer") {
+          await loadTeamData(authToken);
+          setLoading(false);
+          return;
+        }
+
         const response = await fetch(`${API_BASE}/api/analytics`, {
           headers: {
             Authorization: `Bearer ${authToken}`,
@@ -162,6 +194,80 @@ export default function AnalyticsPage() {
     }
   }
 
+  async function fetchOrgInfo(token: string) {
+    const response = await fetch(`${API_BASE}/api/org/me`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+    if (!response.ok) {
+      throw new Error(`Org lookup failed with ${response.status}`);
+    }
+    return response.json() as Promise<{
+      role: string | null;
+      organizationId: string | null;
+      organizationName: string | null;
+    }>;
+  }
+
+  async function loadTeamData(token: string) {
+    setTeamLoading(true);
+    setTeamError("");
+    try {
+      const [teamRes, unassignedRes] = await Promise.all([
+        fetch(`${API_BASE}/api/org/team`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+        fetch(`${API_BASE}/api/org/unassigned`, {
+          headers: { Authorization: `Bearer ${token}` },
+        }),
+      ]);
+
+      if (!teamRes.ok) {
+        throw new Error(`Team request failed with ${teamRes.status}`);
+      }
+      if (!unassignedRes.ok) {
+        throw new Error(`Unassigned request failed with ${unassignedRes.status}`);
+      }
+
+      const teamPayload = await teamRes.json();
+      const unassignedPayload = await unassignedRes.json();
+      setTeamMembers(Array.isArray(teamPayload?.members) ? teamPayload.members : []);
+      setUnassignedUsers(Array.isArray(unassignedPayload?.users) ? unassignedPayload.users : []);
+    } catch (err) {
+      console.error("Failed to load team data", err);
+      setTeamError("Failed to load team data");
+    } finally {
+      setTeamLoading(false);
+    }
+  }
+
+  async function handleInvite() {
+    if (!authToken || !inviteEmail) return;
+    setInviteLoading(true);
+    setTeamError("");
+    try {
+      const response = await fetch(`${API_BASE}/api/org/assign`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ email: inviteEmail }),
+      });
+      if (!response.ok) {
+        throw new Error(`Assign failed with ${response.status}`);
+      }
+      setInviteEmail("");
+      await loadTeamData(authToken);
+    } catch (err) {
+      console.error("Failed to assign trainee", err);
+      setTeamError("Failed to assign trainee");
+    } finally {
+      setInviteLoading(false);
+    }
+  }
+
   const trendData = useMemo(() => {
     if (!data?.trend) return [];
     return data.trend
@@ -190,6 +296,17 @@ export default function AnalyticsPage() {
       { skill: "Confidence", score: Number(data.summary.avgConfidence.toFixed(2)) },
     ];
   }, [data]);
+
+  const teamChartData = useMemo(() => {
+    return teamMembers.map((member) => ({
+      name: member.email,
+      avgOverallScore: Number(member.avgOverallScore.toFixed(2)),
+    }));
+  }, [teamMembers]);
+
+  const leaderboard = useMemo(() => {
+    return [...teamMembers].sort((a, b) => b.avgOverallScore - a.avgOverallScore);
+  }, [teamMembers]);
 
   const summary = data?.summary;
   const hasData = summary && summary.totalSessions > 0;
@@ -296,7 +413,130 @@ export default function AnalyticsPage() {
           </div>
         </header>
 
-        {loading && (
+        {role === "trainer" && (
+          <section
+            style={{
+              display: "flex",
+              flexDirection: "column",
+              gap: "1.5rem",
+              padding: "1.5rem",
+              borderRadius: "18px",
+              background: "rgba(15, 23, 42, 0.85)",
+              border: "1px solid rgba(148, 163, 184, 0.15)",
+            }}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: "0.4rem" }}>
+              <p style={{ margin: 0, fontSize: "0.85rem", opacity: 0.75 }}>Team Dashboard</p>
+              <h2 style={{ margin: 0, fontSize: "1.5rem" }}>{organizationName || "Your Organization"}</h2>
+              {/* TODO: Add enterprise billing indicators. */}
+              {/* TODO: Add org-level reporting overview. */}
+              {/* TODO: Add team performance export controls. */}
+            </div>
+
+            <div style={{ display: "grid", gap: "0.75rem" }}>
+              <label style={{ fontSize: "0.85rem", opacity: 0.8 }}>Assign trainee (unassigned users)</label>
+              <div style={{ display: "flex", gap: "0.75rem", flexWrap: "wrap" }}>
+                <select
+                  value={inviteEmail}
+                  onChange={(event) => setInviteEmail(event.target.value)}
+                  style={{
+                    minWidth: "240px",
+                    padding: "0.5rem 0.75rem",
+                    borderRadius: "10px",
+                    border: "1px solid rgba(148, 163, 184, 0.3)",
+                    background: "rgba(15, 23, 42, 0.6)",
+                    color: "#e2e8f0",
+                  }}
+                >
+                  <option value="">Select trainee</option>
+                  {unassignedUsers.map((user) => (
+                    <option key={user.user_id} value={user.email}>
+                      {user.email}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  onClick={handleInvite}
+                  disabled={!inviteEmail || inviteLoading}
+                  style={{
+                    padding: "0.5rem 1rem",
+                    borderRadius: "10px",
+                    border: "1px solid rgba(255,255,255,0.2)",
+                    background: inviteLoading ? "#475569" : "rgba(34, 197, 94, 0.2)",
+                    color: "#e2e8f0",
+                    cursor: inviteLoading ? "not-allowed" : "pointer",
+                    fontWeight: 600,
+                  }}
+                >
+                  {inviteLoading ? "Assigning..." : "Assign Trainee"}
+                </button>
+              </div>
+            </div>
+
+            {teamLoading && (
+              <div style={{ padding: "1rem", borderRadius: "12px", background: "rgba(15, 23, 42, 0.7)" }}>
+                Loading team data...
+              </div>
+            )}
+
+            {teamError && (
+              <div style={{ padding: "1rem", borderRadius: "12px", background: "rgba(239, 68, 68, 0.15)" }}>
+                {teamError}
+              </div>
+            )}
+
+            {!teamLoading && teamMembers.length === 0 && (
+              <div style={{ padding: "1rem", borderRadius: "12px", background: "rgba(15, 23, 42, 0.7)" }}>
+                No trainees assigned yet.
+              </div>
+            )}
+
+            {!teamLoading && teamMembers.length > 0 && (
+              <>
+                <div style={{ width: "100%", height: "260px" }}>
+                  <ResponsiveContainer>
+                    <BarChart data={teamChartData} margin={{ top: 10, right: 20, left: 0, bottom: 20 }}>
+                      <CartesianGrid strokeDasharray="3 3" stroke="#1f2a44" />
+                      <XAxis dataKey="name" stroke="#94a3b8" tick={{ fontSize: 11 }} interval={0} />
+                      <YAxis domain={[0, 10]} stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                      <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1f2a44" }} />
+                      <Bar dataKey="avgOverallScore" fill="#38bdf8" radius={[6, 6, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                <section style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: "1rem" }}>
+                  <div style={{ padding: "1rem", borderRadius: "12px", background: "rgba(15, 23, 42, 0.7)" }}>
+                    <h3 style={{ margin: "0 0 0.75rem", fontSize: "1.05rem" }}>Leaderboard</h3>
+                    <ol style={{ margin: 0, paddingLeft: "1.25rem" }}>
+                      {leaderboard.map((member) => (
+                        <li key={member.user_id} style={{ marginBottom: "0.4rem" }}>
+                          {member.email} — {member.avgOverallScore.toFixed(2)}
+                        </li>
+                      ))}
+                    </ol>
+                  </div>
+
+                  <div style={{ padding: "1rem", borderRadius: "12px", background: "rgba(15, 23, 42, 0.7)" }}>
+                    <h3 style={{ margin: "0 0 0.75rem", fontSize: "1.05rem" }}>Trainee Summary</h3>
+                    <div style={{ display: "grid", gap: "0.6rem" }}>
+                      {teamMembers.map((member) => (
+                        <div key={member.user_id} style={{ display: "flex", flexDirection: "column", gap: "0.25rem" }}>
+                          <strong>{member.email}</strong>
+                          <span style={{ fontSize: "0.85rem", opacity: 0.75 }}>
+                            Sessions: {member.sessionCount} · Overall {member.avgOverallScore.toFixed(2)} · Objection {member.avgObjectionHandling.toFixed(2)} · Clarity {member.avgCommunicationClarity.toFixed(2)} · Confidence {member.avgConfidence.toFixed(2)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </section>
+              </>
+            )}
+          </section>
+        )}
+
+        {role !== "trainer" && loading && (
           <div
             style={{
               padding: "1.5rem",
@@ -309,7 +549,7 @@ export default function AnalyticsPage() {
           </div>
         )}
 
-        {!loading && error && (
+        {role !== "trainer" && !loading && error && (
           <div
             style={{
               padding: "1.5rem",
@@ -322,7 +562,7 @@ export default function AnalyticsPage() {
           </div>
         )}
 
-        {!loading && !error && !hasData && (
+        {role !== "trainer" && !loading && !error && !hasData && (
           <div
             style={{
               padding: "1.5rem",
@@ -335,7 +575,7 @@ export default function AnalyticsPage() {
           </div>
         )}
 
-        {!loading && !error && hasData && summary && (
+        {role !== "trainer" && !loading && !error && hasData && summary && (
           <>
             <section
               style={{

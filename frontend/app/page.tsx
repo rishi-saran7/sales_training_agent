@@ -87,6 +87,7 @@ function safeParse(raw: string): AgentMessage | null {
 
 // Shared constant so the WebSocket client points at the backend dev server.
 const WS_URL = "ws://localhost:3001";
+const API_BASE = "http://localhost:3001";
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_DURATION_MS = 32; // 20–40 ms target; 32 ms is a balanced middle.
 
@@ -149,6 +150,8 @@ export default function HomePage() {
   const [coachHintVisible, setCoachHintVisible] = useState<boolean>(false);
   const [coachHintsEnabled, setCoachHintsEnabled] = useState<boolean>(true);
   const [authLoading, setAuthLoading] = useState<boolean>(true);
+  const [adminChecking, setAdminChecking] = useState<boolean>(true);
+  const [authToken, setAuthToken] = useState<string>("");
   const [authEmail, setAuthEmail] = useState<string>("");
   const [difficultyLevel, setDifficultyLevel] = useState<string>("");
   const [autoDifficultyEnabled, setAutoDifficultyEnabled] = useState<boolean>(true);
@@ -169,6 +172,39 @@ export default function HomePage() {
   const coachHintsEnabledRef = useRef<boolean>(true);
   const autoDifficultyEnabledRef = useRef<boolean>(true);
   const authTokenRef = useRef<string>("");
+
+  useEffect(() => {
+    let active = true;
+
+    async function redirectIfAdmin() {
+      if (authLoading) return;
+      if (!authToken) {
+        if (active) setAdminChecking(false);
+        return;
+      }
+
+      setAdminChecking(true);
+      try {
+        const response = await fetch(`${API_BASE}/api/admin/me`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (active && response.ok) {
+          router.replace("/admin");
+          return;
+        }
+      } catch (err) {
+        console.error("Failed to check admin status", err);
+      } finally {
+        if (active) setAdminChecking(false);
+      }
+    }
+
+    redirectIfAdmin();
+
+    return () => {
+      active = false;
+    };
+  }, [authLoading, authToken, router]);
 
   // TODO: Adaptive interruption thresholds — adjust BARGE_IN_ENERGY_THRESHOLD based on ambient noise levels.
   const BARGE_IN_ENERGY_THRESHOLD = 0.035; // RMS energy threshold to detect user speech during agent playback.
@@ -299,10 +335,12 @@ export default function HomePage() {
       const session = data.session;
       if (!session) {
         setAuthLoading(false);
+        setAuthToken("");
         router.push("/login");
         return;
       }
       authTokenRef.current = session.access_token;
+      setAuthToken(session.access_token);
       setAuthEmail(session.user.email || "");
       sendAuthToken(session.access_token);
       setAuthLoading(false);
@@ -311,11 +349,13 @@ export default function HomePage() {
     const { data: authListener } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!session) {
         authTokenRef.current = "";
+        setAuthToken("");
         setAuthLoading(false);
         router.push("/login");
         return;
       }
       authTokenRef.current = session.access_token;
+      setAuthToken(session.access_token);
       setAuthEmail(session.user.email || "");
       sendAuthToken(session.access_token);
       setAuthLoading(false);
@@ -890,7 +930,7 @@ export default function HomePage() {
     return "Connecting...";
   })();
 
-  if (authLoading) {
+  if (authLoading || adminChecking) {
     return (
       <main
         style={{

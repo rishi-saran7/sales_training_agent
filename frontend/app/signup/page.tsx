@@ -109,6 +109,9 @@ export default function SignupPage() {
         <p style={{ margin: 0, fontSize: "0.85rem", opacity: 0.8 }}>
           Already have an account? <Link href="/login">Log in</Link>
         </p>
+        <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.7 }}>
+          New accounts start as trainees. Your admin will assign you to a trainer.
+        </p>
       </form>
     </main>
   );
