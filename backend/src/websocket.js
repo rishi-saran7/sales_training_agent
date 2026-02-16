@@ -13,10 +13,36 @@ const COACHING_SYSTEM_PROMPT =
   'Only suggest improvements.\n' +
   'If no suggestion is needed, return null.';
 
+const DIFFICULTY_CONFIG = {
+  thresholds: {
+    beginnerMax: 5,
+    intermediateMax: 7.5,
+  },
+  sessionLookback: 10,
+  defaultLevel: 'Beginner',
+  modifiers: {
+    Beginner:
+      'DIFFICULTY: Beginner.\n' +
+      'Customer is slightly patient.\n' +
+      'Gives clearer objections.\n' +
+      'Interrupts less often.',
+    Intermediate:
+      'DIFFICULTY: Intermediate.\n' +
+      'Customer shows balanced skepticism.\n' +
+      'Occasional interruptions.',
+    Advanced:
+      'DIFFICULTY: Advanced.\n' +
+      'Customer is highly skeptical and interrupts frequently.\n' +
+      'Raises complex objections and demands ROI, compliance, and competitor comparisons.',
+  },
+};
+
 // Message types keep the contract explicit and easy to extend later.
 const MESSAGE_TYPES = {
   AGENT_CONNECTED: 'agent_connected',
   AUTH: 'auth',
+  DIFFICULTY_ASSIGNED: 'difficulty.assigned',
+  DIFFICULTY_MODE: 'difficulty.mode',
   PING: 'ping',
   PONG: 'pong',
   SCENARIO_SELECT: 'scenario.select',
@@ -110,6 +136,67 @@ const SCENARIO_MAP = SCENARIOS.reduce((acc, scenario) => {
   return acc;
 }, {});
 
+// TODO: Add skill-specific difficulty weighting per score dimension.
+// TODO: Add scenario-specific scaling for difficulty thresholds.
+// TODO: Add adaptive mid-call escalation based on live performance signals.
+
+function toNumber(value) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : null;
+}
+
+function computeAverages(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) {
+    return null;
+  }
+
+  let count = 0;
+  let overallSum = 0;
+  let objectionSum = 0;
+  let claritySum = 0;
+  let confidenceSum = 0;
+
+  for (const row of rows) {
+    const feedback = row?.feedback || {};
+    const overall = toNumber(feedback.overall_score);
+    const objection = toNumber(feedback.objection_handling);
+    const clarity = toNumber(feedback.communication_clarity);
+    const confidence = toNumber(feedback.confidence);
+
+    if (overall === null && objection === null && clarity === null && confidence === null) {
+      continue;
+    }
+
+    count += 1;
+    overallSum += overall ?? 0;
+    objectionSum += objection ?? 0;
+    claritySum += clarity ?? 0;
+    confidenceSum += confidence ?? 0;
+  }
+
+  if (count === 0) return null;
+
+  return {
+    overall_score: overallSum / count,
+    objection_handling: objectionSum / count,
+    communication_clarity: claritySum / count,
+    confidence: confidenceSum / count,
+  };
+}
+
+function classifyDifficulty(averages) {
+  if (!averages) return DIFFICULTY_CONFIG.defaultLevel;
+  const overall = averages.overall_score ?? 0;
+  if (overall < DIFFICULTY_CONFIG.thresholds.beginnerMax) return 'Beginner';
+  if (overall <= DIFFICULTY_CONFIG.thresholds.intermediateMax) return 'Intermediate';
+  return 'Advanced';
+}
+
+function applyDifficultyModifier(basePrompt, level) {
+  const modifier = DIFFICULTY_CONFIG.modifiers[level] || '';
+  return modifier ? `${basePrompt}\n\n${modifier}` : basePrompt;
+}
+
 // TODO: Add scenario difficulty levels.
 // TODO: Add industry-specific scripts.
 // TODO: Support trainer-created custom scenarios.
@@ -162,6 +249,9 @@ function setupWebsocket(server) {
     let coachHintSentForTurn = false;
     let lastCoachHintAt = 0;
     let currentUserId = null;
+    let autoDifficultyEnabled = true;
+    let currentDifficulty = DIFFICULTY_CONFIG.defaultLevel;
+    let difficultyAverages = null;
 
     function resetConversationForScenario(scenario) {
       conversation = [
@@ -173,7 +263,57 @@ function setupWebsocket(server) {
       accumulatedTranscript = '';
     }
 
-    function startCallWithScenario(scenario) {
+    function sendDifficultyUpdate(level, averages) {
+      ws.send(
+        JSON.stringify({
+          type: MESSAGE_TYPES.DIFFICULTY_ASSIGNED,
+          level,
+          averages,
+          autoEnabled: autoDifficultyEnabled,
+        })
+      );
+    }
+
+    async function fetchRecentAverages() {
+      if (!supabase || !currentUserId) return null;
+
+      const { data, error } = await supabase
+        .from('call_sessions')
+        .select('feedback')
+        .eq('user_id', currentUserId)
+        .order('created_at', { ascending: false })
+        .limit(DIFFICULTY_CONFIG.sessionLookback);
+
+      if (error) {
+        console.warn('[difficulty] Failed to fetch recent sessions:', error.message || error);
+        return null;
+      }
+
+      return computeAverages(data || []);
+    }
+
+    function buildScenarioWithDifficulty(scenario, level) {
+      return {
+        ...scenario,
+        systemPrompt: applyDifficultyModifier(scenario.systemPrompt, level),
+      };
+    }
+
+    async function resolveDifficulty() {
+      if (!autoDifficultyEnabled) {
+        return {
+          level: 'Intermediate',
+          averages: null,
+          applyModifier: false,
+        };
+      }
+
+      const averages = await fetchRecentAverages();
+      const level = classifyDifficulty(averages);
+      return { level, averages, applyModifier: true };
+    }
+
+    function startCallWithScenario(scenario, difficultyContext) {
       activeScenario = scenario;
       scenarioLocked = true;
       callEnded = false;
@@ -182,6 +322,24 @@ function setupWebsocket(server) {
       sessionId = randomUUID();
       resetConversationForScenario(scenario);
       console.log(`[scenario] Call started under scenario: ${scenario.name}`);
+      if (difficultyContext) {
+        currentDifficulty = difficultyContext.level;
+        difficultyAverages = difficultyContext.averages;
+        console.log(
+          `[difficulty] Assigned ${currentDifficulty} (avg overall: ${
+            difficultyAverages?.overall_score?.toFixed(2) ?? 'n/a'
+          })`
+        );
+        if (difficultyAverages) {
+          console.log(
+            `[difficulty] Averages: overall=${difficultyAverages.overall_score?.toFixed(2) ?? 'n/a'}, ` +
+              `objection=${difficultyAverages.objection_handling?.toFixed(2) ?? 'n/a'}, ` +
+              `clarity=${difficultyAverages.communication_clarity?.toFixed(2) ?? 'n/a'}, ` +
+              `confidence=${difficultyAverages.confidence?.toFixed(2) ?? 'n/a'}`
+          );
+        }
+        sendDifficultyUpdate(currentDifficulty, difficultyAverages);
+      }
     }
 
     // TODO: Add advanced scoring engine to enrich hint quality.
@@ -444,6 +602,12 @@ function setupWebsocket(server) {
         );
 
         if (supabase && sessionId && currentUserId) {
+          const feedbackForStorage = {
+            ...feedbackData,
+            difficulty: currentDifficulty,
+            difficulty_averages: difficultyAverages,
+            difficulty_auto: autoDifficultyEnabled,
+          };
           supabase
             .from('call_sessions')
             .insert({
@@ -452,7 +616,7 @@ function setupWebsocket(server) {
               scenario: activeScenario ? activeScenario.name : 'Unknown',
               call_duration: callDurationMs,
               transcript,
-              feedback: feedbackData,
+              feedback: feedbackForStorage,
             })
             .then(({ error }) => {
               if (error) {
@@ -557,6 +721,13 @@ function setupWebsocket(server) {
             });
           break;
         }
+        case MESSAGE_TYPES.DIFFICULTY_MODE: {
+          const enabled = typeof parsed.enabled === 'boolean' ? parsed.enabled : true;
+          autoDifficultyEnabled = enabled;
+          console.log(`[difficulty] Auto difficulty ${enabled ? 'enabled' : 'disabled'}`);
+          sendDifficultyUpdate(currentDifficulty, difficultyAverages);
+          break;
+        }
         case MESSAGE_TYPES.PONG: {
           // Compute round-trip latency using the original ping timestamp from the client.
           if (typeof parsed.timestamp === 'number') {
@@ -584,91 +755,99 @@ function setupWebsocket(server) {
           break;
         }
         case MESSAGE_TYPES.USER_AUDIO_START: {
-          if (!scenarioLocked) {
-            startCallWithScenario(activeScenario);
-          }
-          coachHintSentForTurn = false;
-          streamState.active = true;
-          streamState.sampleRate = typeof parsed.sampleRate === 'number' ? parsed.sampleRate : null;
-          streamState.totalSamples = 0;
-          streamState.startedAt = Date.now();
-          console.log('[ws] User audio start received');
-
-          // Establish Deepgram realtime session for this turn.
-          const apiKey = process.env.DEEPGRAM_API_KEY;
-          if (!apiKey) {
-            console.error('[ws] DEEPGRAM_API_KEY not set; cannot start Deepgram session');
-            ws.send(
-              JSON.stringify({
-                type: 'error',
-                message: 'DEEPGRAM_API_KEY not configured',
-              })
-            );
-            break;
-          }
-
-          // Clean any previous session for safety.
-          if (deepgramClient) {
-            deepgramClient.close();
-            deepgramClient = null;
-          }
-
-          deepgramClient = new DeepgramClient(apiKey, (eventType, data) => {
-            switch (eventType) {
-              case 'stt.partial': {
-                ws.send(
-                  JSON.stringify({
-                    type: MESSAGE_TYPES.STT_PARTIAL,
-                    text: data.text,
-                  })
-                );
-                break;
-              }
-              case 'stt.final': {
-                ws.send(
-                  JSON.stringify({
-                    type: MESSAGE_TYPES.STT_FINAL,
-                    text: data.text,
-                  })
-                );
-                // Accumulate transcript and reset silence timer.
-                const cleaned = (data.text || '').trim();
-                if (cleaned) {
-                  accumulatedTranscript = accumulatedTranscript ? `${accumulatedTranscript} ${cleaned}` : cleaned;
-                  generateCoachHint(accumulatedTranscript);
-                }
-                // Clear previous timer and start new 3-second countdown.
-                if (silenceTimer) clearTimeout(silenceTimer);
-                silenceTimer = setTimeout(() => {
-                  silenceTimer = null;
-                  if (accumulatedTranscript) {
-                    const toSend = accumulatedTranscript;
-                    accumulatedTranscript = '';
-                    queueTranscript(toSend);
-                    coachHintSentForTurn = false;
-                  }
-                }, SILENCE_TIMEOUT_MS);
-                break;
-              }
-              default:
-                break;
+          (async () => {
+            if (!scenarioLocked) {
+              const difficultyContext = await resolveDifficulty();
+              const scenarioWithDifficulty = difficultyContext.applyModifier
+                ? buildScenarioWithDifficulty(activeScenario, difficultyContext.level)
+                : activeScenario;
+              startCallWithScenario(scenarioWithDifficulty, difficultyContext);
             }
-          });
+            coachHintSentForTurn = false;
+            streamState.active = true;
+            streamState.sampleRate = typeof parsed.sampleRate === 'number' ? parsed.sampleRate : null;
+            streamState.totalSamples = 0;
+            streamState.startedAt = Date.now();
+            console.log('[ws] User audio start received');
 
-          deepgramClient
-            .connect()
-            .then(() => {
-              console.log('[ws] Deepgram streaming started');
-            })
-            .catch((err) => {
-              console.error('[ws] Failed to connect to Deepgram:', err);
+            // Establish Deepgram realtime session for this turn.
+            const apiKey = process.env.DEEPGRAM_API_KEY;
+            if (!apiKey) {
+              console.error('[ws] DEEPGRAM_API_KEY not set; cannot start Deepgram session');
               ws.send(
                 JSON.stringify({
                   type: 'error',
-                  message: 'Failed to connect to Deepgram',
+                  message: 'DEEPGRAM_API_KEY not configured',
                 })
               );
+              return;
+            }
+
+            // Clean any previous session for safety.
+            if (deepgramClient) {
+              deepgramClient.close();
+              deepgramClient = null;
+            }
+
+            deepgramClient = new DeepgramClient(apiKey, (eventType, data) => {
+              switch (eventType) {
+                case 'stt.partial': {
+                  ws.send(
+                    JSON.stringify({
+                      type: MESSAGE_TYPES.STT_PARTIAL,
+                      text: data.text,
+                    })
+                  );
+                  break;
+                }
+                case 'stt.final': {
+                  ws.send(
+                    JSON.stringify({
+                      type: MESSAGE_TYPES.STT_FINAL,
+                      text: data.text,
+                    })
+                  );
+                  // Accumulate transcript and reset silence timer.
+                  const cleaned = (data.text || '').trim();
+                  if (cleaned) {
+                    accumulatedTranscript = accumulatedTranscript ? `${accumulatedTranscript} ${cleaned}` : cleaned;
+                    generateCoachHint(accumulatedTranscript);
+                  }
+                  // Clear previous timer and start new 3-second countdown.
+                  if (silenceTimer) clearTimeout(silenceTimer);
+                  silenceTimer = setTimeout(() => {
+                    silenceTimer = null;
+                    if (accumulatedTranscript) {
+                      const toSend = accumulatedTranscript;
+                      accumulatedTranscript = '';
+                      queueTranscript(toSend);
+                      coachHintSentForTurn = false;
+                    }
+                  }, SILENCE_TIMEOUT_MS);
+                  break;
+                }
+                default:
+                  break;
+              }
             });
+
+            deepgramClient
+              .connect()
+              .then(() => {
+                console.log('[ws] Deepgram streaming started');
+              })
+              .catch((err) => {
+                console.error('[ws] Failed to connect to Deepgram:', err);
+                ws.send(
+                  JSON.stringify({
+                    type: 'error',
+                    message: 'Failed to connect to Deepgram',
+                  })
+                );
+              });
+          })().catch((err) => {
+            console.error('[difficulty] Failed to resolve difficulty:', err);
+          });
           break;
         }
         case MESSAGE_TYPES.USER_AUDIO_CHUNK: {
