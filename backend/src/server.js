@@ -77,6 +77,17 @@ async function getAdmin(userId) {
   return data || null;
 }
 
+async function getAdmins() {
+  const { data, error } = await supabase
+    .from('admins')
+    .select('user_id');
+
+  if (error) {
+    throw error;
+  }
+  return Array.isArray(data) ? data : [];
+}
+
 async function getOrgMembers(orgId) {
   const { data, error } = await supabase
     .from('organization_members')
@@ -685,10 +696,13 @@ app.get('/api/org/unassigned', async (req, res) => {
       return;
     }
 
+    const admins = await getAdmins();
+    const adminIds = new Set((admins || []).map((admin) => admin.user_id));
     const assigned = new Set((members || []).map((member) => member.user_id));
     const unassigned = allUsers
       .filter((candidate) => candidate?.id && candidate?.email)
       .filter((candidate) => !assigned.has(candidate.id))
+      .filter((candidate) => !adminIds.has(candidate.id))
       .map((candidate) => ({ user_id: candidate.id, email: candidate.email }));
 
     res.json({ users: unassigned });
