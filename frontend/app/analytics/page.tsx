@@ -357,24 +357,26 @@ export default function AnalyticsPage() {
             Track call quality and coaching outcomes over time.
           </p>
           <div style={{ marginTop: "0.5rem" }}>
-            <Link
-              href="/"
-              style={{
-                display: "inline-flex",
-                alignItems: "center",
-                gap: "0.4rem",
-                padding: "0.45rem 0.85rem",
-                borderRadius: "999px",
-                border: "1px solid rgba(255,255,255,0.2)",
-                background: "rgba(148, 163, 184, 0.15)",
-                color: "#e2e8f0",
-                textDecoration: "none",
-                fontSize: "0.85rem",
-                fontWeight: 600,
-              }}
-            >
-              Back to Call
-            </Link>
+            {role !== "trainer" && role !== "" && (
+              <Link
+                href="/"
+                style={{
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "0.4rem",
+                  padding: "0.45rem 0.85rem",
+                  borderRadius: "999px",
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: "rgba(148, 163, 184, 0.15)",
+                  color: "#e2e8f0",
+                  textDecoration: "none",
+                  fontSize: "0.85rem",
+                  fontWeight: 600,
+                }}
+              >
+                Back to Call
+              </Link>
+            )}
             <button
               onClick={handleLogout}
               style={{

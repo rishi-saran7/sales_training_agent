@@ -150,7 +150,7 @@ export default function HomePage() {
   const [coachHintVisible, setCoachHintVisible] = useState<boolean>(false);
   const [coachHintsEnabled, setCoachHintsEnabled] = useState<boolean>(true);
   const [authLoading, setAuthLoading] = useState<boolean>(true);
-  const [adminChecking, setAdminChecking] = useState<boolean>(true);
+  const [roleChecking, setRoleChecking] = useState<boolean>(true);
   const [authToken, setAuthToken] = useState<string>("");
   const [authEmail, setAuthEmail] = useState<string>("");
   const [difficultyLevel, setDifficultyLevel] = useState<string>("");
@@ -176,30 +176,40 @@ export default function HomePage() {
   useEffect(() => {
     let active = true;
 
-    async function redirectIfAdmin() {
+    async function redirectIfRole() {
       if (authLoading) return;
       if (!authToken) {
-        if (active) setAdminChecking(false);
+        if (active) setRoleChecking(false);
         return;
       }
 
-      setAdminChecking(true);
       try {
-        const response = await fetch(`${API_BASE}/api/admin/me`, {
+        const adminResponse = await fetch(`${API_BASE}/api/admin/me`, {
           headers: { Authorization: `Bearer ${authToken}` },
         });
-        if (active && response.ok) {
+        if (active && adminResponse.ok) {
           router.replace("/admin");
           return;
         }
+
+        const orgResponse = await fetch(`${API_BASE}/api/org/me`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (active && orgResponse.ok) {
+          const payload = await orgResponse.json();
+          if (payload?.role === "trainer") {
+            router.replace("/analytics");
+            return;
+          }
+        }
       } catch (err) {
-        console.error("Failed to check admin status", err);
+        console.error("Failed to check role status", err);
       } finally {
-        if (active) setAdminChecking(false);
+        if (active) setRoleChecking(false);
       }
     }
 
-    redirectIfAdmin();
+    redirectIfRole();
 
     return () => {
       active = false;
@@ -930,7 +940,7 @@ export default function HomePage() {
     return "Connecting...";
   })();
 
-  if (authLoading || adminChecking) {
+  if (authLoading || roleChecking) {
     return (
       <main
         style={{
