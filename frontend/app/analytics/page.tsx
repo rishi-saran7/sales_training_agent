@@ -132,6 +132,36 @@ export default function AnalyticsPage() {
     router.push("/login");
   }
 
+  async function downloadAnalyticsReport() {
+    if (!authToken) {
+      router.push("/login");
+      return;
+    }
+
+    try {
+      const response = await fetch(`${API_BASE}/api/report/analytics`, {
+        headers: {
+          Authorization: `Bearer ${authToken}`,
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`Request failed with ${response.status}`);
+      }
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = "performance-analytics-report.pdf";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to download analytics report", err);
+      setError("Failed to download analytics report");
+    }
+  }
+
   const trendData = useMemo(() => {
     if (!data?.trend) return [];
     return data.trend
@@ -243,6 +273,22 @@ export default function AnalyticsPage() {
               }}
             >
               Log Out
+            </button>
+            <button
+              onClick={downloadAnalyticsReport}
+              style={{
+                marginLeft: "0.75rem",
+                padding: "0.45rem 0.85rem",
+                borderRadius: "999px",
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "rgba(14, 165, 233, 0.2)",
+                color: "#e2e8f0",
+                cursor: "pointer",
+                fontSize: "0.85rem",
+                fontWeight: 600,
+              }}
+            >
+              Download Report
             </button>
             {authEmail && (
               <span style={{ marginLeft: "0.75rem", fontSize: "0.8rem", opacity: 0.75 }}>{authEmail}</span>

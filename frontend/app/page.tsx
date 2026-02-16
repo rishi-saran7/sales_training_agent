@@ -13,6 +13,8 @@ type MicStatus = "idle" | "recording" | "error";
 const MESSAGE_TYPES = {
   AGENT_CONNECTED: "agent_connected",
   AUTH: "auth",
+  DIFFICULTY_ASSIGNED: "difficulty.assigned",
+  DIFFICULTY_MODE: "difficulty.mode",
   PING: "ping",
   PONG: "pong",
   SCENARIO_SELECT: "scenario.select",
@@ -57,6 +59,7 @@ type PastSession = {
 
 type AgentMessage =
   | { type: typeof MESSAGE_TYPES.AGENT_CONNECTED; message: string }
+  | { type: typeof MESSAGE_TYPES.DIFFICULTY_ASSIGNED; level?: string; averages?: Record<string, number | null>; autoEnabled?: boolean }
   | { type: typeof MESSAGE_TYPES.PING; timestamp: number }
   | { type: typeof MESSAGE_TYPES.PONG; timestamp?: number }
   | { type: typeof MESSAGE_TYPES.USER_AUDIO_START }
@@ -134,6 +137,7 @@ export default function HomePage() {
   const [callEnded, setCallEnded] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<FeedbackPayload | null>(null);
   const [callMetrics, setCallMetrics] = useState<{ duration: number; turns: number } | null>(null);
+  const [latestSessionId, setLatestSessionId] = useState<string | number | null>(null);
   const [scenarioId, setScenarioId] = useState<string>(SCENARIOS[0]?.id || "");
   const [scenarioLocked, setScenarioLocked] = useState<boolean>(false);
   const [pastSessions, setPastSessions] = useState<PastSession[]>([]);
@@ -146,6 +150,8 @@ export default function HomePage() {
   const [coachHintsEnabled, setCoachHintsEnabled] = useState<boolean>(true);
   const [authLoading, setAuthLoading] = useState<boolean>(true);
   const [authEmail, setAuthEmail] = useState<string>("");
+  const [difficultyLevel, setDifficultyLevel] = useState<string>("");
+  const [autoDifficultyEnabled, setAutoDifficultyEnabled] = useState<boolean>(true);
 
   const recordingRef = useRef<RecordingHandles | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
@@ -161,6 +167,7 @@ export default function HomePage() {
   const bargeInEnableAtRef = useRef<number>(0); // Timestamp after which barge-in is allowed for this utterance.
   const coachHintTimerRef = useRef<number | null>(null);
   const coachHintsEnabledRef = useRef<boolean>(true);
+  const autoDifficultyEnabledRef = useRef<boolean>(true);
   const authTokenRef = useRef<string>("");
 
   // TODO: Adaptive interruption thresholds — adjust BARGE_IN_ENERGY_THRESHOLD based on ambient noise levels.
@@ -260,12 +267,26 @@ export default function HomePage() {
     coachHintsEnabledRef.current = coachHintsEnabled;
   }, [coachHintsEnabled]);
 
+  useEffect(() => {
+    autoDifficultyEnabledRef.current = autoDifficultyEnabled;
+  }, [autoDifficultyEnabled]);
+
   function sendAuthToken(token: string) {
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
     socketRef.current.send(
       JSON.stringify({
         type: MESSAGE_TYPES.AUTH,
         token,
+      })
+    );
+  }
+
+  function sendDifficultyMode(enabled: boolean) {
+    if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) return;
+    socketRef.current.send(
+      JSON.stringify({
+        type: MESSAGE_TYPES.DIFFICULTY_MODE,
+        enabled,
       })
     );
   }
@@ -316,6 +337,7 @@ export default function HomePage() {
       if (authTokenRef.current) {
         sendAuthToken(authTokenRef.current);
       }
+      sendDifficultyMode(autoDifficultyEnabledRef.current);
     };
 
     socket.onclose = () => {
@@ -337,6 +359,15 @@ export default function HomePage() {
       switch (parsed.type) {
         case MESSAGE_TYPES.AGENT_CONNECTED: {
           console.log("Agent connected message received");
+          break;
+        }
+        case MESSAGE_TYPES.DIFFICULTY_ASSIGNED: {
+          if (typeof parsed.level === "string") {
+            setDifficultyLevel(parsed.level);
+          }
+          if (typeof parsed.autoEnabled === "boolean") {
+            setAutoDifficultyEnabled(parsed.autoEnabled);
+          }
           break;
         }
         case MESSAGE_TYPES.PING: {
@@ -473,6 +504,8 @@ export default function HomePage() {
             });
             setCallEnded(true);
             clearCoachHint();
+            setLatestSessionId(null);
+            fetchLatestSessionId();
             console.log("Call feedback received", parsed.payload);
           }
           break;
@@ -594,6 +627,59 @@ export default function HomePage() {
       setSessionsError("Failed to load sessions");
     } finally {
       setSessionsLoading(false);
+    }
+  }
+
+  async function fetchLatestSessionId() {
+    if (!authTokenRef.current) return;
+
+    try {
+      const response = await fetch("http://localhost:3001/api/sessions", {
+        headers: {
+          Authorization: `Bearer ${authTokenRef.current}`,
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`Request failed with ${response.status}`);
+      }
+      const data = await response.json();
+      const sessions = Array.isArray(data?.sessions) ? data.sessions : [];
+      if (sessions.length > 0) {
+        setLatestSessionId(sessions[0].id);
+      }
+    } catch (err) {
+      console.error("Failed to fetch latest session", err);
+    }
+  }
+
+  async function downloadReport(sessionId: string | number) {
+    if (!authTokenRef.current) {
+      router.push("/login");
+      return;
+    }
+
+    try {
+      const response = await fetch(`http://localhost:3001/api/report/${sessionId}`, {
+        headers: {
+          Authorization: `Bearer ${authTokenRef.current}`,
+        },
+      });
+      if (!response.ok) {
+        throw new Error(`Request failed with ${response.status}`);
+      }
+
+      const blob = await response.blob();
+      const url = window.URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = `performance-report-${sessionId}.pdf`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (err) {
+      console.error("Failed to download report", err);
+      setSessionsError("Failed to download report");
     }
   }
 
@@ -790,6 +876,14 @@ export default function HomePage() {
     console.log("Call reset");
   }
 
+  function toggleAutoDifficulty() {
+    setAutoDifficultyEnabled((prev) => {
+      const next = !prev;
+      sendDifficultyMode(next);
+      return next;
+    });
+  }
+
   const statusLabel = (() => {
     if (status === "connected") return "Connected to agent";
     if (status === "disconnected") return "Connection lost";
@@ -951,6 +1045,24 @@ export default function HomePage() {
           >
             Start New Call
           </button>
+          {latestSessionId && (
+            <button
+              onClick={() => downloadReport(latestSessionId)}
+              style={{
+                marginTop: "0.75rem",
+                padding: "0.75rem 1.5rem",
+                borderRadius: "10px",
+                border: "1px solid rgba(255,255,255,0.2)",
+                background: "rgba(14, 165, 233, 0.2)",
+                color: "#e8eef5",
+                cursor: "pointer",
+                fontWeight: 600,
+                width: "100%",
+              }}
+            >
+              Download Report
+            </button>
+          )}
         </div>
       ) : (
         // Main Call Screen
@@ -1069,6 +1181,35 @@ export default function HomePage() {
           {sessionsError && (
             <span style={{ fontSize: "0.85rem", color: "#fca5a5" }}>{sessionsError}</span>
           )}
+        </div>
+        <div style={{ marginTop: "0.75rem", display: "flex", gap: "0.75rem", alignItems: "center" }}>
+          <div
+            style={{
+              padding: "0.4rem 0.75rem",
+              borderRadius: "999px",
+              border: "1px solid rgba(255,255,255,0.15)",
+              background: "rgba(148, 163, 184, 0.15)",
+              fontSize: "0.8rem",
+              fontWeight: 600,
+            }}
+          >
+            Difficulty: {difficultyLevel || "Pending"}
+          </div>
+          <button
+            onClick={toggleAutoDifficulty}
+            style={{
+              padding: "0.4rem 0.75rem",
+              borderRadius: "999px",
+              border: "1px solid rgba(255,255,255,0.2)",
+              background: autoDifficultyEnabled ? "rgba(16, 185, 129, 0.2)" : "rgba(148, 163, 184, 0.2)",
+              color: "#e8eef5",
+              cursor: "pointer",
+              fontSize: "0.8rem",
+              fontWeight: 600,
+            }}
+          >
+            Auto Difficulty: {autoDifficultyEnabled ? "On" : "Off"}
+          </button>
         </div>
         <div style={{ marginTop: "1rem" }}>
           <label style={{ display: "block", fontSize: "0.85rem", opacity: 0.8, marginBottom: "0.35rem" }}>
@@ -1269,6 +1410,22 @@ export default function HomePage() {
                     <p style={{ margin: "0.25rem 0 0", fontSize: "0.85rem", opacity: 0.8 }}>
                       Date: {session.created_at ? new Date(session.created_at).toLocaleString() : "Unknown"}
                     </p>
+                    <button
+                      onClick={() => downloadReport(session.id)}
+                      style={{
+                        marginTop: "0.6rem",
+                        padding: "0.4rem 0.75rem",
+                        borderRadius: "8px",
+                        border: "1px solid rgba(255,255,255,0.2)",
+                        background: "rgba(14, 165, 233, 0.2)",
+                        color: "#e8eef5",
+                        cursor: "pointer",
+                        fontSize: "0.8rem",
+                        fontWeight: 600,
+                      }}
+                    >
+                      Download Report
+                    </button>
                   </div>
                 ))}
               </div>
