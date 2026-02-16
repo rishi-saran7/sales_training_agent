@@ -12,6 +12,8 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
 const app = express();
 
+app.use(express.json());
+
 // Allow the Next.js dev server to reach this API. Adjust origins when deploying.
 app.use(cors({ origin: 'http://localhost:3000' }));
 
@@ -45,6 +47,86 @@ async function requireUser(req, res) {
 // TODO: Add trainer comments section to reports.
 // TODO: Add batch export for multi-session reports.
 // TODO: Add email delivery for completed reports.
+// TODO: Add enterprise billing for organizations.
+// TODO: Add org-level reporting exports.
+// TODO: Add team performance export jobs.
+
+async function getMembership(userId) {
+  const { data, error } = await supabase
+    .from('organization_members')
+    .select('id, organization_id, role, organizations(name)')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+  return data || null;
+}
+
+async function getAdmin(userId) {
+  const { data, error } = await supabase
+    .from('admins')
+    .select('user_id')
+    .eq('user_id', userId)
+    .maybeSingle();
+
+  if (error) {
+    throw error;
+  }
+  return data || null;
+}
+
+async function getOrgMembers(orgId) {
+  const { data, error } = await supabase
+    .from('organization_members')
+    .select('user_id, role')
+    .eq('organization_id', orgId);
+
+  if (error) {
+    throw error;
+  }
+
+  return Array.isArray(data) ? data : [];
+}
+
+async function listUsers(perPage = 200) {
+  if (!supabase?.auth?.admin) {
+    throw new Error('Supabase admin API unavailable');
+  }
+  const { data, error } = await supabase.auth.admin.listUsers({ page: 1, perPage });
+  if (error) {
+    throw error;
+  }
+  return data?.users || [];
+}
+
+function normalizeEmail(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
+function coerceText(value) {
+  return String(value || '').trim();
+}
+
+async function requireAdmin(userId, res) {
+  const admin = await getAdmin(userId);
+  if (!admin) {
+    res.status(403).json({ error: 'Admin role required' });
+    return null;
+  }
+  return admin;
+}
+
+async function requireTrainer(userId, res) {
+  const membership = await getMembership(userId);
+  if (!membership || membership.role !== 'trainer') {
+    res.status(403).json({ error: 'Trainer role required' });
+    return null;
+  }
+  console.log(`[org] Role detected: ${membership.role}`);
+  return membership;
+}
 
 function formatDate(value) {
   const date = value ? new Date(value) : new Date();
@@ -112,8 +194,6 @@ function ensureSpace(doc, height) {
   const bottom = doc.page.height - doc.page.margins.bottom;
   if (doc.y + height > bottom) {
     doc.addPage();
-    doc.x = doc.page.margins.left;
-    doc.y = doc.page.margins.top;
   }
 }
 
@@ -281,13 +361,31 @@ function toNumber(value) {
   return Number.isFinite(num) ? num : null;
 }
 
-async function fetchAnalyticsData(userId) {
+async function fetchAnalyticsData(userIds) {
+  const ids = Array.isArray(userIds) ? userIds : [userIds];
+  if (ids.length === 0) {
+    return {
+      summary: {
+        totalSessions: 0,
+        avgOverallScore: 0,
+        avgObjectionHandling: 0,
+        avgCommunicationClarity: 0,
+        avgConfidence: 0,
+        bestScore: 0,
+        worstScore: 0,
+      },
+      trend: [],
+      byScenario: [],
+      range: null,
+    };
+  }
+
   const { data, error } = await supabase
     .from('call_sessions')
     .select(
       'scenario, created_at, overall_score:feedback->>overall_score, objection_handling:feedback->>objection_handling, communication_clarity:feedback->>communication_clarity, confidence:feedback->>confidence'
     )
-    .eq('user_id', userId)
+    .in('user_id', ids)
     .order('created_at', { ascending: true })
     .limit(500);
 
@@ -387,6 +485,709 @@ async function fetchAnalyticsData(userId) {
   };
 }
 
+app.post('/api/org/bootstrap', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const existing = await getMembership(user.id);
+    if (existing) {
+      res.json({
+        organizationId: existing.organization_id,
+        organizationName: existing.organizations?.name || 'Organization',
+        role: existing.role,
+      });
+      return;
+    }
+
+    const orgName = `Team ${user.email ? user.email.split('@')[0] : 'Trainer'}`;
+    const { data: org, error: orgError } = await supabase
+      .from('organizations')
+      .insert({ name: orgName })
+      .select('id, name')
+      .single();
+
+    if (orgError || !org) {
+      console.error('[org] Failed to create organization:', orgError?.message || orgError);
+      res.status(500).json({ error: 'Failed to create organization' });
+      return;
+    }
+
+    const { error: memberError } = await supabase
+      .from('organization_members')
+      .insert({ organization_id: org.id, user_id: user.id, role: 'trainer' });
+
+    if (memberError) {
+      console.error('[org] Failed to add trainer membership:', memberError.message || memberError);
+      res.status(500).json({ error: 'Failed to add organization member' });
+      return;
+    }
+
+    console.log(`[org] Org created (${org.name}) and trainer assigned`);
+    res.json({ organizationId: org.id, organizationName: org.name, role: 'trainer' });
+  } catch (err) {
+    console.error('[org] Bootstrap failed:', err.message || err);
+    res.status(500).json({ error: 'Failed to bootstrap organization' });
+  }
+});
+
+app.post('/api/admin/trainers', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const targetEmail = normalizeEmail(req.body?.email);
+  const orgName = coerceText(req.body?.orgName);
+  const organizationId = coerceText(req.body?.organizationId);
+  const tempPassword = coerceText(req.body?.password);
+  if (!targetEmail) {
+    res.status(400).json({ error: 'Missing trainer email' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const allUsers = await listUsers(200);
+    let targetUser = allUsers.find((candidate) => normalizeEmail(candidate.email) === targetEmail);
+
+    if (!targetUser) {
+      if (!supabase?.auth?.admin) {
+        res.status(500).json({ error: 'Supabase admin API unavailable' });
+        return;
+      }
+
+      if (tempPassword) {
+        const { data: created, error: createError } = await supabase.auth.admin.createUser({
+          email: targetEmail,
+          password: tempPassword,
+          email_confirm: true,
+        });
+        if (createError || !created?.user) {
+          console.error('[admin] Failed to create user:', createError?.message || createError);
+          res.status(500).json({ error: 'Failed to create trainer user' });
+          return;
+        }
+        targetUser = created.user;
+      } else {
+        const { data: invited, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(targetEmail);
+        if (inviteError || !invited?.user) {
+          console.error('[admin] Failed to invite user:', inviteError?.message || inviteError);
+          res.status(500).json({ error: 'Failed to invite trainer user' });
+          return;
+        }
+        targetUser = invited.user;
+      }
+    }
+
+    const { data: existingMember } = await supabase
+      .from('organization_members')
+      .select('id')
+      .eq('user_id', targetUser.id)
+      .maybeSingle();
+
+    if (existingMember) {
+      res.status(409).json({ error: 'User already assigned to an organization' });
+      return;
+    }
+
+    let org = null;
+    if (organizationId) {
+      const { data: existingOrg, error: orgFetchError } = await supabase
+        .from('organizations')
+        .select('id, name')
+        .eq('id', organizationId)
+        .maybeSingle();
+
+      if (orgFetchError || !existingOrg) {
+        console.error('[admin] Failed to load organization:', orgFetchError?.message || orgFetchError);
+        res.status(404).json({ error: 'Organization not found' });
+        return;
+      }
+      org = existingOrg;
+    } else {
+      const fallbackName = targetUser.email ? targetUser.email.split('@')[0] : 'Trainer';
+      const trainerOrgName = orgName || `Team ${fallbackName}`;
+
+      const { data: createdOrg, error: orgError } = await supabase
+        .from('organizations')
+        .insert({ name: trainerOrgName })
+        .select('id, name')
+        .single();
+
+      if (orgError || !createdOrg) {
+        console.error('[admin] Failed to create organization:', orgError?.message || orgError);
+        res.status(500).json({ error: 'Failed to create organization' });
+        return;
+      }
+      org = createdOrg;
+    }
+
+    const { error: memberError } = await supabase
+      .from('organization_members')
+      .insert({ organization_id: org.id, user_id: targetUser.id, role: 'trainer' });
+
+    if (memberError) {
+      console.error('[admin] Failed to add trainer:', memberError.message || memberError);
+      res.status(500).json({ error: 'Failed to add trainer' });
+      return;
+    }
+
+    console.log(`[admin] Trainer created: ${targetUser.email}`);
+    res.json({ success: true, user_id: targetUser.id, email: targetUser.email, organizationId: org.id });
+  } catch (err) {
+    console.error('[admin] Failed to create trainer:', err.message || err);
+    res.status(500).json({ error: 'Failed to create trainer' });
+  }
+});
+
+app.get('/api/org/me', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const membership = await getMembership(user.id);
+    if (!membership) {
+      res.json({ role: null, organizationId: null, organizationName: null });
+      return;
+    }
+    console.log(`[org] Role detected: ${membership.role}`);
+    res.json({
+      role: membership.role,
+      organizationId: membership.organization_id,
+      organizationName: membership.organizations?.name || 'Organization',
+    });
+  } catch (err) {
+    console.error('[org] Failed to load membership:', err.message || err);
+    res.status(500).json({ error: 'Failed to load organization membership' });
+  }
+});
+
+app.get('/api/org/unassigned', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const membership = await requireTrainer(user.id, res);
+    if (!membership) return;
+
+    const allUsers = await listUsers(200);
+    const { data: members, error } = await supabase
+      .from('organization_members')
+      .select('user_id');
+
+    if (error) {
+      console.error('[org] Failed to fetch members:', error.message || error);
+      res.status(500).json({ error: 'Failed to fetch members' });
+      return;
+    }
+
+    const assigned = new Set((members || []).map((member) => member.user_id));
+    const unassigned = allUsers
+      .filter((candidate) => candidate?.id && candidate?.email)
+      .filter((candidate) => !assigned.has(candidate.id))
+      .map((candidate) => ({ user_id: candidate.id, email: candidate.email }));
+
+    res.json({ users: unassigned });
+  } catch (err) {
+    console.error('[org] Failed to load unassigned users:', err.message || err);
+    res.status(500).json({ error: 'Failed to load unassigned users' });
+  }
+});
+
+app.post('/api/org/assign', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const traineeEmail = normalizeEmail(req.body?.email);
+  if (!traineeEmail) {
+    res.status(400).json({ error: 'Missing trainee email' });
+    return;
+  }
+
+  try {
+    const membership = await requireTrainer(user.id, res);
+    if (!membership) return;
+
+    const allUsers = await listUsers(200);
+    const targetUser = allUsers.find((candidate) => normalizeEmail(candidate.email) === traineeEmail);
+    if (!targetUser) {
+      res.status(404).json({ error: 'User not found' });
+      return;
+    }
+
+    const { data: existingMember } = await supabase
+      .from('organization_members')
+      .select('id')
+      .eq('user_id', targetUser.id)
+      .maybeSingle();
+
+    if (existingMember) {
+      res.status(409).json({ error: 'User already assigned to an organization' });
+      return;
+    }
+
+    const { error: insertError } = await supabase
+      .from('organization_members')
+      .insert({
+        organization_id: membership.organization_id,
+        user_id: targetUser.id,
+        role: 'trainee',
+      });
+
+    if (insertError) {
+      console.error('[org] Failed to add trainee:', insertError.message || insertError);
+      res.status(500).json({ error: 'Failed to assign trainee' });
+      return;
+    }
+
+    console.log(`[org] Member added: ${targetUser.email}`);
+    res.json({ success: true, user_id: targetUser.id, email: targetUser.email });
+  } catch (err) {
+    console.error('[org] Failed to assign trainee:', err.message || err);
+    res.status(500).json({ error: 'Failed to assign trainee' });
+  }
+});
+
+app.get('/api/org/team', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const membership = await requireTrainer(user.id, res);
+    if (!membership) return;
+
+    const members = await getOrgMembers(membership.organization_id);
+    const trainees = members.filter((member) => member.role === 'trainee');
+    const traineeIds = trainees.map((member) => member.user_id);
+
+    if (traineeIds.length === 0) {
+      res.json({ members: [] });
+      return;
+    }
+
+    const allUsers = await listUsers(200);
+    const emailMap = new Map(allUsers.map((candidate) => [candidate.id, candidate.email]));
+
+    const { data: sessions, error: sessionError } = await supabase
+      .from('call_sessions')
+      .select('user_id, feedback')
+      .in('user_id', traineeIds);
+
+    if (sessionError) {
+      console.error('[org] Failed to fetch team sessions:', sessionError.message || sessionError);
+      res.status(500).json({ error: 'Failed to fetch team sessions' });
+      return;
+    }
+
+    const stats = new Map();
+    (sessions || []).forEach((session) => {
+      const feedback = session.feedback || {};
+      const overall = toNumber(feedback.overall_score) ?? 0;
+      const objection = toNumber(feedback.objection_handling) ?? 0;
+      const clarity = toNumber(feedback.communication_clarity) ?? 0;
+      const confidence = toNumber(feedback.confidence) ?? 0;
+      if (!stats.has(session.user_id)) {
+        stats.set(session.user_id, {
+          count: 0,
+          overall: 0,
+          objection: 0,
+          clarity: 0,
+          confidence: 0,
+        });
+      }
+      const entry = stats.get(session.user_id);
+      entry.count += 1;
+      entry.overall += overall;
+      entry.objection += objection;
+      entry.clarity += clarity;
+      entry.confidence += confidence;
+    });
+
+    const membersPayload = traineeIds.map((traineeId) => {
+      const entry = stats.get(traineeId) || {
+        count: 0,
+        overall: 0,
+        objection: 0,
+        clarity: 0,
+        confidence: 0,
+      };
+      const count = entry.count || 0;
+      return {
+        user_id: traineeId,
+        email: emailMap.get(traineeId) || 'Unknown',
+        avgOverallScore: count > 0 ? entry.overall / count : 0,
+        avgObjectionHandling: count > 0 ? entry.objection / count : 0,
+        avgCommunicationClarity: count > 0 ? entry.clarity / count : 0,
+        avgConfidence: count > 0 ? entry.confidence / count : 0,
+        sessionCount: count,
+      };
+    });
+
+    res.json({ members: membersPayload });
+  } catch (err) {
+    console.error('[org] Failed to fetch team data:', err.message || err);
+    res.status(500).json({ error: 'Failed to fetch team data' });
+  }
+});
+
+app.get('/api/admin/me', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+    res.json({ isAdmin: true, userId: user.id });
+  } catch (err) {
+    console.error('[admin] Failed to check admin:', err.message || err);
+    res.status(500).json({ error: 'Failed to verify admin' });
+  }
+});
+
+app.get('/api/admin/trainers', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { data: trainers, error } = await supabase
+      .from('organization_members')
+      .select('user_id, organization_id, role, organizations(name)')
+      .eq('role', 'trainer');
+
+    if (error) {
+      console.error('[admin] Failed to fetch trainers:', error.message || error);
+      res.status(500).json({ error: 'Failed to fetch trainers' });
+      return;
+    }
+
+    const allUsers = await listUsers(200);
+    const emailMap = new Map(allUsers.map((candidate) => [candidate.id, candidate.email]));
+
+    const payload = (trainers || []).map((trainer) => ({
+      user_id: trainer.user_id,
+      email: emailMap.get(trainer.user_id) || 'Unknown',
+      organization_id: trainer.organization_id,
+      organization_name: trainer.organizations?.name || 'Organization',
+      role: trainer.role,
+    }));
+
+    res.json({ trainers: payload });
+  } catch (err) {
+    console.error('[admin] Failed to load trainers:', err.message || err);
+    res.status(500).json({ error: 'Failed to fetch trainers' });
+  }
+});
+
+app.patch('/api/admin/trainers/:userId', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const targetUserId = req.params.userId;
+  const organizationId = coerceText(req.body?.organizationId);
+
+  if (!targetUserId || !organizationId) {
+    res.status(400).json({ error: 'Missing trainer or organization' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { data, error } = await supabase
+      .from('organization_members')
+      .update({ organization_id: organizationId, role: 'trainer' })
+      .eq('user_id', targetUserId)
+      .select('user_id, organization_id')
+      .maybeSingle();
+
+    if (error || !data) {
+      console.error('[admin] Failed to update trainer:', error?.message || error);
+      res.status(500).json({ error: 'Failed to update trainer' });
+      return;
+    }
+
+    res.json({ success: true, trainer: data });
+  } catch (err) {
+    console.error('[admin] Failed to update trainer:', err.message || err);
+    res.status(500).json({ error: 'Failed to update trainer' });
+  }
+});
+
+app.delete('/api/admin/trainers/:userId', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const targetUserId = req.params.userId;
+  if (!targetUserId) {
+    res.status(400).json({ error: 'Missing trainer id' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { error } = await supabase
+      .from('organization_members')
+      .delete()
+      .eq('user_id', targetUserId)
+      .eq('role', 'trainer');
+
+    if (error) {
+      console.error('[admin] Failed to remove trainer:', error.message || error);
+      res.status(500).json({ error: 'Failed to remove trainer' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin] Failed to remove trainer:', err.message || err);
+    res.status(500).json({ error: 'Failed to remove trainer' });
+  }
+});
+
+app.get('/api/admin/orgs', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { data, error } = await supabase
+      .from('organizations')
+      .select('id, name, created_at')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('[admin] Failed to load organizations:', error.message || error);
+      res.status(500).json({ error: 'Failed to load organizations' });
+      return;
+    }
+
+    res.json({ organizations: data || [] });
+  } catch (err) {
+    console.error('[admin] Failed to load organizations:', err.message || err);
+    res.status(500).json({ error: 'Failed to load organizations' });
+  }
+});
+
+app.post('/api/admin/orgs', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const orgName = coerceText(req.body?.name);
+  if (!orgName) {
+    res.status(400).json({ error: 'Missing organization name' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { data, error } = await supabase
+      .from('organizations')
+      .insert({ name: orgName })
+      .select('id, name')
+      .single();
+
+    if (error || !data) {
+      console.error('[admin] Failed to create organization:', error?.message || error);
+      res.status(500).json({ error: 'Failed to create organization' });
+      return;
+    }
+
+    res.json({ organization: data });
+  } catch (err) {
+    console.error('[admin] Failed to create organization:', err.message || err);
+    res.status(500).json({ error: 'Failed to create organization' });
+  }
+});
+
+app.patch('/api/admin/orgs/:orgId', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const orgId = req.params.orgId;
+  const orgName = coerceText(req.body?.name);
+  if (!orgId || !orgName) {
+    res.status(400).json({ error: 'Missing organization details' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { data, error } = await supabase
+      .from('organizations')
+      .update({ name: orgName })
+      .eq('id', orgId)
+      .select('id, name')
+      .single();
+
+    if (error || !data) {
+      console.error('[admin] Failed to update organization:', error?.message || error);
+      res.status(500).json({ error: 'Failed to update organization' });
+      return;
+    }
+
+    res.json({ organization: data });
+  } catch (err) {
+    console.error('[admin] Failed to update organization:', err.message || err);
+    res.status(500).json({ error: 'Failed to update organization' });
+  }
+});
+
+app.delete('/api/admin/orgs/:orgId', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const orgId = req.params.orgId;
+  if (!orgId) {
+    res.status(400).json({ error: 'Missing organization id' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { error: memberError } = await supabase
+      .from('organization_members')
+      .delete()
+      .eq('organization_id', orgId);
+
+    if (memberError) {
+      console.error('[admin] Failed to remove org members:', memberError.message || memberError);
+      res.status(500).json({ error: 'Failed to remove org members' });
+      return;
+    }
+
+    const { error: orgError } = await supabase
+      .from('organizations')
+      .delete()
+      .eq('id', orgId);
+
+    if (orgError) {
+      console.error('[admin] Failed to delete organization:', orgError.message || orgError);
+      res.status(500).json({ error: 'Failed to delete organization' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin] Failed to delete organization:', err.message || err);
+    res.status(500).json({ error: 'Failed to delete organization' });
+  }
+});
+
+app.patch('/api/admin/users/:userId', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const targetUserId = req.params.userId;
+  const nextEmail = normalizeEmail(req.body?.email);
+  const nextPassword = coerceText(req.body?.password);
+
+  if (!targetUserId || (!nextEmail && !nextPassword)) {
+    res.status(400).json({ error: 'Missing user update details' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const payload = {};
+    if (nextEmail) payload.email = nextEmail;
+    if (nextPassword) payload.password = nextPassword;
+
+    const { data, error } = await supabase.auth.admin.updateUserById(targetUserId, payload);
+    if (error) {
+      console.error('[admin] Failed to update user:', error.message || error);
+      res.status(500).json({ error: 'Failed to update user' });
+      return;
+    }
+
+    res.json({ success: true, user: data?.user || null });
+  } catch (err) {
+    console.error('[admin] Failed to update user:', err.message || err);
+    res.status(500).json({ error: 'Failed to update user' });
+  }
+});
+
+app.post('/api/admin/users/:userId/disable', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const targetUserId = req.params.userId;
+  if (!targetUserId) {
+    res.status(400).json({ error: 'Missing user id' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { error } = await supabase.auth.admin.updateUserById(targetUserId, {
+      ban_duration: '87600h',
+    });
+
+    if (error) {
+      console.error('[admin] Failed to disable user:', error.message || error);
+      res.status(500).json({ error: 'Failed to disable user' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin] Failed to disable user:', err.message || err);
+    res.status(500).json({ error: 'Failed to disable user' });
+  }
+});
+
+app.post('/api/admin/users/:userId/enable', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const targetUserId = req.params.userId;
+  if (!targetUserId) {
+    res.status(400).json({ error: 'Missing user id' });
+    return;
+  }
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const { error } = await supabase.auth.admin.updateUserById(targetUserId, {
+      ban_duration: 'none',
+    });
+
+    if (error) {
+      console.error('[admin] Failed to enable user:', error.message || error);
+      res.status(500).json({ error: 'Failed to enable user' });
+      return;
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[admin] Failed to enable user:', err.message || err);
+    res.status(500).json({ error: 'Failed to enable user' });
+  }
+});
+
 // Lightweight health check so we can quickly verify the HTTP layer is alive.
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
@@ -424,11 +1225,21 @@ app.get('/api/report/analytics', async (req, res) => {
   if (!user) return;
 
   try {
-    const analytics = await fetchAnalyticsData(user.id);
+    let scopedUserIds = [user.id];
+    const membership = await getMembership(user.id);
+    if (membership?.role === 'trainer') {
+      const members = await getOrgMembers(membership.organization_id);
+      scopedUserIds = members.map((member) => member.user_id);
+      console.log('[org] Role detected: trainer');
+    } else if (membership?.role === 'trainee') {
+      console.log('[org] Role detected: trainee');
+    }
+
+    const analytics = await fetchAnalyticsData(scopedUserIds);
     const { data: feedbackRows, error: feedbackError } = await supabase
       .from('call_sessions')
       .select('feedback, scenario, created_at, overall_score:feedback->>overall_score')
-      .eq('user_id', user.id)
+      .in('user_id', scopedUserIds)
       .order('created_at', { ascending: true })
       .limit(500);
 
@@ -475,7 +1286,6 @@ app.get('/api/report/analytics', async (req, res) => {
     addDivider(doc);
 
     addSectionTitle(doc, 'Summary');
-    doc.x = doc.page.margins.left;
     doc.text(`Total Sessions: ${analytics.summary.totalSessions}`);
     doc.text(`Average Overall Score: ${formatScore(analytics.summary.avgOverallScore)}`);
     doc.text(`Average Objection Handling: ${formatScore(analytics.summary.avgObjectionHandling)}`);
@@ -485,7 +1295,6 @@ app.get('/api/report/analytics', async (req, res) => {
     doc.text(`Worst Score: ${formatScore(analytics.summary.worstScore)}`);
 
     addSectionTitle(doc, 'Performance Trend');
-    doc.x = doc.page.margins.left;
     if (trendDelta === null) {
       doc.text('Not enough data to calculate recent trend.');
     } else if (trendDelta > 0) {
@@ -500,7 +1309,6 @@ app.get('/api/report/analytics', async (req, res) => {
     }
 
     addSectionTitle(doc, 'Scenario Breakdown');
-    doc.x = doc.page.margins.left;
     if (analytics.byScenario.length === 0) {
       doc.text('No scenario data available.');
     } else {
@@ -517,7 +1325,6 @@ app.get('/api/report/analytics', async (req, res) => {
     }
 
     addSectionTitle(doc, 'Common Strengths');
-    doc.x = doc.page.margins.left;
     if (commonStrengths.length === 0) {
       doc.text('No strengths recorded.');
     } else {
@@ -525,7 +1332,6 @@ app.get('/api/report/analytics', async (req, res) => {
     }
 
     addSectionTitle(doc, 'Common Improvement Areas');
-    doc.x = doc.page.margins.left;
     if (commonWeaknesses.length === 0) {
       doc.text('No improvement areas recorded.');
     } else {
@@ -536,7 +1342,6 @@ app.get('/api/report/analytics', async (req, res) => {
     }
 
     addSectionTitle(doc, 'Suggested Action Plan');
-    doc.x = doc.page.margins.left;
     if (commonSuggestions.length === 0) {
       doc.text('No suggestions recorded.');
     } else {
@@ -580,8 +1385,23 @@ app.get('/api/report/:sessionId', async (req, res) => {
     }
 
     if (data.user_id !== user.id) {
-      res.status(403).json({ error: 'Unauthorized' });
-      return;
+      const membership = await getMembership(user.id);
+      if (!membership || membership.role !== 'trainer') {
+        res.status(403).json({ error: 'Unauthorized' });
+        return;
+      }
+      const { data: sameOrg } = await supabase
+        .from('organization_members')
+        .select('id')
+        .eq('organization_id', membership.organization_id)
+        .eq('user_id', data.user_id)
+        .maybeSingle();
+
+      if (!sameOrg) {
+        res.status(403).json({ error: 'Unauthorized' });
+        return;
+      }
+      console.log('[org] Role detected: trainer');
     }
 
     const feedback = data.feedback || {};
@@ -696,7 +1516,17 @@ app.get('/api/analytics', async (req, res) => {
   if (!user) return;
 
   try {
-    const analytics = await fetchAnalyticsData(user.id);
+    let scopedUserIds = [user.id];
+    const membership = await getMembership(user.id);
+    if (membership?.role === 'trainer') {
+      const members = await getOrgMembers(membership.organization_id);
+      scopedUserIds = members.map((member) => member.user_id);
+      console.log('[org] Role detected: trainer');
+    } else if (membership?.role === 'trainee') {
+      console.log('[org] Role detected: trainee');
+    }
+
+    const analytics = await fetchAnalyticsData(scopedUserIds);
     res.json({
       summary: analytics.summary,
       trend: analytics.trend,
