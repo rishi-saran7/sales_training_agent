@@ -1327,6 +1327,610 @@ app.post('/api/admin/users/:userId/enable', async (req, res) => {
   }
 });
 
+// ============================================================
+// MESSAGING ENDPOINTS
+// ============================================================
+
+// Helper: resolve the "other" participant's email
+async function resolveEmails(userIds) {
+  if (!userIds.length) return {};
+  const allUsers = await listUsers(200);
+  const map = {};
+  for (const u of allUsers) {
+    if (userIds.includes(u.id)) {
+      map[u.id] = u.email || u.id;
+    }
+  }
+  return map;
+}
+
+// Helper: normalise participant ordering so we always store (min, max) to avoid dups
+function orderedParticipants(a, b) {
+  return a < b ? { participant_1: a, participant_2: b } : { participant_1: b, participant_2: a };
+}
+
+// GET /api/conversations — list conversations for the current user
+// Admin sees ALL conversations; trainer sees own + org-scoped; trainee sees own.
+app.get('/api/conversations', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await getAdmin(user.id);
+
+    let conversations;
+    if (admin) {
+      // Admin sees every conversation
+      const { data, error } = await supabase
+        .from('conversations')
+        .select('*')
+        .order('updated_at', { ascending: false });
+      if (error) throw error;
+      conversations = data || [];
+    } else {
+      const { data, error } = await supabase
+        .from('conversations')
+        .select('*')
+        .or(`participant_1.eq.${user.id},participant_2.eq.${user.id}`)
+        .order('updated_at', { ascending: false });
+      if (error) throw error;
+      conversations = data || [];
+    }
+
+    // Gather unique participant ids to resolve emails
+    const participantIds = new Set();
+    for (const c of conversations) {
+      participantIds.add(c.participant_1);
+      participantIds.add(c.participant_2);
+    }
+    const emailMap = await resolveEmails([...participantIds]);
+
+    // For each conversation, get the last message and unread count
+    const enriched = await Promise.all(
+      conversations.map(async (conv) => {
+        const { data: lastMsg } = await supabase
+          .from('messages')
+          .select('content, sender_id, created_at')
+          .eq('conversation_id', conv.id)
+          .order('created_at', { ascending: false })
+          .limit(1)
+          .maybeSingle();
+
+        const { count: unreadCount } = await supabase
+          .from('messages')
+          .select('id', { count: 'exact', head: true })
+          .eq('conversation_id', conv.id)
+          .eq('read', false)
+          .neq('sender_id', user.id);
+
+        const otherId = conv.participant_1 === user.id ? conv.participant_2 : conv.participant_1;
+
+        return {
+          id: conv.id,
+          participant_1: conv.participant_1,
+          participant_2: conv.participant_2,
+          organization_id: conv.organization_id,
+          otherUserId: otherId,
+          otherEmail: emailMap[otherId] || otherId,
+          myEmail: emailMap[user.id] || user.id,
+          lastMessage: lastMsg?.content || null,
+          lastMessageAt: lastMsg?.created_at || conv.updated_at,
+          unreadCount: unreadCount || 0,
+          created_at: conv.created_at,
+          updated_at: conv.updated_at,
+          // For admin view — show both emails
+          participant_1_email: emailMap[conv.participant_1] || conv.participant_1,
+          participant_2_email: emailMap[conv.participant_2] || conv.participant_2,
+        };
+      })
+    );
+
+    res.json({ conversations: enriched });
+  } catch (err) {
+    console.error('[messages] Failed to list conversations:', err.message || err);
+    res.status(500).json({ error: 'Failed to list conversations' });
+  }
+});
+
+// POST /api/conversations — start or get a conversation with another user
+// Body: { otherUserId }
+app.post('/api/conversations', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const { otherUserId } = req.body || {};
+  if (!otherUserId) {
+    res.status(400).json({ error: 'otherUserId is required' });
+    return;
+  }
+
+  try {
+    const ordered = orderedParticipants(user.id, otherUserId);
+
+    // Check for existing conversation
+    const { data: existing } = await supabase
+      .from('conversations')
+      .select('*')
+      .eq('participant_1', ordered.participant_1)
+      .eq('participant_2', ordered.participant_2)
+      .maybeSingle();
+
+    if (existing) {
+      res.json({ conversation: existing, created: false });
+      return;
+    }
+
+    // Access control: trainer can only chat with their org trainees, trainees with their trainer, admin with anyone
+    const admin = await getAdmin(user.id);
+    if (!admin) {
+      const membership = await getMembership(user.id);
+      const otherMembership = await getMembership(otherUserId);
+      if (!membership || !otherMembership || membership.organization_id !== otherMembership.organization_id) {
+        res.status(403).json({ error: 'You can only message users in your organization' });
+        return;
+      }
+    }
+
+    // Determine org for conversation
+    let orgId = null;
+    const m1 = await getMembership(user.id);
+    const m2 = await getMembership(otherUserId);
+    if (m1?.organization_id) orgId = m1.organization_id;
+    else if (m2?.organization_id) orgId = m2.organization_id;
+
+    const { data: newConv, error } = await supabase
+      .from('conversations')
+      .insert({
+        participant_1: ordered.participant_1,
+        participant_2: ordered.participant_2,
+        organization_id: orgId,
+      })
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json({ conversation: newConv, created: true });
+  } catch (err) {
+    console.error('[messages] Failed to create conversation:', err.message || err);
+    res.status(500).json({ error: 'Failed to create conversation' });
+  }
+});
+
+// GET /api/conversations/:id/messages — get messages in a conversation
+app.get('/api/conversations/:id/messages', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const conversationId = req.params.id;
+  if (!conversationId) {
+    res.status(400).json({ error: 'Missing conversation id' });
+    return;
+  }
+
+  try {
+    // Verify access: either participant OR admin
+    const admin = await getAdmin(user.id);
+    if (!admin) {
+      const { data: conv } = await supabase
+        .from('conversations')
+        .select('participant_1, participant_2')
+        .eq('id', conversationId)
+        .maybeSingle();
+      if (!conv || (conv.participant_1 !== user.id && conv.participant_2 !== user.id)) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+    }
+
+    const limit = parseInt(req.query.limit) || 100;
+    const before = req.query.before; // cursor for pagination
+
+    let query = supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true })
+      .limit(limit);
+
+    if (before) {
+      query = query.lt('created_at', before);
+    }
+
+    const { data: messages, error } = await query;
+    if (error) throw error;
+
+    // Enrich messages with sender email and role
+    const senderIds = [...new Set((messages || []).map((m) => m.sender_id))];
+    const emailMap = await resolveEmails(senderIds);
+    const adminList = await getAdmins();
+    const adminIds = adminList.map((a) => a.user_id);
+
+    const enriched = (messages || []).map((m) => {
+      let senderRole = 'unknown';
+      if (adminIds.includes(m.sender_id)) {
+        senderRole = 'admin';
+      }
+      return {
+        ...m,
+        sender_email: emailMap[m.sender_id] || m.sender_id,
+        sender_role: senderRole,
+      };
+    });
+
+    // Resolve non-admin roles in bulk
+    const nonAdminIds = senderIds.filter((id) => !adminIds.includes(id));
+    if (nonAdminIds.length > 0) {
+      const { data: memberships } = await supabase
+        .from('organization_members')
+        .select('user_id, role')
+        .in('user_id', nonAdminIds);
+      const roleMap = {};
+      for (const mem of (memberships || [])) {
+        roleMap[mem.user_id] = mem.role;
+      }
+      for (const msg of enriched) {
+        if (msg.sender_role === 'unknown' && roleMap[msg.sender_id]) {
+          msg.sender_role = roleMap[msg.sender_id];
+        }
+      }
+    }
+
+    res.json({ messages: enriched });
+  } catch (err) {
+    console.error('[messages] Failed to fetch messages:', err.message || err);
+    res.status(500).json({ error: 'Failed to fetch messages' });
+  }
+});
+
+// POST /api/conversations/:id/messages — send a message
+// Body: { content }
+app.post('/api/conversations/:id/messages', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const conversationId = req.params.id;
+  const { content } = req.body || {};
+  if (!conversationId || !content?.trim()) {
+    res.status(400).json({ error: 'Missing conversation id or message content' });
+    return;
+  }
+
+  try {
+    // Verify access: either participant OR admin
+    const admin = await getAdmin(user.id);
+    if (!admin) {
+      const { data: conv } = await supabase
+        .from('conversations')
+        .select('participant_1, participant_2')
+        .eq('id', conversationId)
+        .maybeSingle();
+      if (!conv || (conv.participant_1 !== user.id && conv.participant_2 !== user.id)) {
+        res.status(403).json({ error: 'Access denied' });
+        return;
+      }
+    }
+
+    const { data: message, error } = await supabase
+      .from('messages')
+      .insert({
+        conversation_id: conversationId,
+        sender_id: user.id,
+        content: content.trim(),
+      })
+      .select('*')
+      .single();
+
+    if (error) throw error;
+
+    // Touch the conversation's updated_at
+    await supabase
+      .from('conversations')
+      .update({ updated_at: new Date().toISOString() })
+      .eq('id', conversationId);
+
+    res.json({ message });
+  } catch (err) {
+    console.error('[messages] Failed to send message:', err.message || err);
+    res.status(500).json({ error: 'Failed to send message' });
+  }
+});
+
+// PATCH /api/messages/:id/read — mark a message as read
+app.patch('/api/messages/:id/read', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const { data: msg } = await supabase
+      .from('messages')
+      .select('id, conversation_id, sender_id')
+      .eq('id', req.params.id)
+      .maybeSingle();
+
+    if (!msg) {
+      res.status(404).json({ error: 'Message not found' });
+      return;
+    }
+
+    // Only the receiver can mark as read (not the sender)
+    const { data: conv } = await supabase
+      .from('conversations')
+      .select('participant_1, participant_2')
+      .eq('id', msg.conversation_id)
+      .maybeSingle();
+
+    if (!conv || (conv.participant_1 !== user.id && conv.participant_2 !== user.id)) {
+      res.status(403).json({ error: 'Access denied' });
+      return;
+    }
+
+    const { error } = await supabase
+      .from('messages')
+      .update({ read: true })
+      .eq('id', req.params.id);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[messages] Failed to mark read:', err.message || err);
+    res.status(500).json({ error: 'Failed to mark message as read' });
+  }
+});
+
+// POST /api/conversations/:id/read-all — mark all messages in a conversation as read
+app.post('/api/conversations/:id/read-all', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const conversationId = req.params.id;
+  try {
+    const { error } = await supabase
+      .from('messages')
+      .update({ read: true })
+      .eq('conversation_id', conversationId)
+      .neq('sender_id', user.id)
+      .eq('read', false);
+
+    if (error) throw error;
+    res.json({ success: true });
+  } catch (err) {
+    console.error('[messages] Failed to mark all read:', err.message || err);
+    res.status(500).json({ error: 'Failed to mark messages as read' });
+  }
+});
+
+// GET /api/messages/contacts — get available contacts for the current user
+app.get('/api/messages/contacts', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await getAdmin(user.id);
+    const allUsers = await listUsers(200);
+    const adminList = await getAdmins();
+    const adminIds = adminList.map((a) => a.user_id);
+
+    if (admin) {
+      // Admin can message anyone (all trainers + all trainees)
+      const { data: allMembers } = await supabase
+        .from('organization_members')
+        .select('user_id, role, organization_id, organizations(name)');
+
+      const contacts = (allMembers || [])
+        .filter((m) => m.user_id !== user.id)
+        .map((m) => {
+          const u = allUsers.find((au) => au.id === m.user_id);
+          return {
+            user_id: m.user_id,
+            email: u?.email || m.user_id,
+            role: m.role,
+            organization_id: m.organization_id,
+            organizationName: m.organizations?.name || '',
+          };
+        });
+
+      res.json({ contacts });
+      return;
+    }
+
+    const membership = await getMembership(user.id);
+    if (!membership) {
+      res.json({ contacts: [] });
+      return;
+    }
+
+    if (membership.role === 'trainer') {
+      // Trainer can message their org trainees
+      const orgMembers = await getOrgMembers(membership.organization_id);
+      const contacts = orgMembers
+        .filter((m) => m.user_id !== user.id && !adminIds.includes(m.user_id))
+        .map((m) => {
+          const u = allUsers.find((au) => au.id === m.user_id);
+          return {
+            user_id: m.user_id,
+            email: u?.email || m.user_id,
+            role: m.role,
+            organization_id: membership.organization_id,
+            organizationName: membership.organizations?.name || '',
+          };
+        });
+
+      res.json({ contacts });
+      return;
+    }
+
+    if (membership.role === 'trainee') {
+      // Trainee can message their trainer
+      const orgMembers = await getOrgMembers(membership.organization_id);
+      const trainer = orgMembers.find((m) => m.role === 'trainer');
+      if (!trainer) {
+        res.json({ contacts: [] });
+        return;
+      }
+      const u = allUsers.find((au) => au.id === trainer.user_id);
+      res.json({
+        contacts: [
+          {
+            user_id: trainer.user_id,
+            email: u?.email || trainer.user_id,
+            role: 'trainer',
+            organization_id: membership.organization_id,
+            organizationName: membership.organizations?.name || '',
+          },
+        ],
+      });
+      return;
+    }
+
+    res.json({ contacts: [] });
+  } catch (err) {
+    console.error('[messages] Failed to get contacts:', err.message || err);
+    res.status(500).json({ error: 'Failed to get contacts' });
+  }
+});
+
+// ============================================================
+// COMPLAINTS ENDPOINTS
+// ============================================================
+
+// POST /api/complaints — file a complaint (trainee against admin/system, trainer against trainee)
+// Body: { subject, message, againstUserId? }
+app.post('/api/complaints', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const { subject, message, againstUserId } = req.body || {};
+  if (!subject?.trim() || !message?.trim()) {
+    res.status(400).json({ error: 'Subject and message are required' });
+    return;
+  }
+
+  try {
+    const membership = await getMembership(user.id);
+    if (!membership) {
+      res.status(403).json({ error: 'You must belong to an organization to file a complaint' });
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('complaints')
+      .insert({
+        filed_by: user.id,
+        filed_by_role: membership.role,
+        against_user_id: againstUserId || null,
+        organization_id: membership.organization_id,
+        subject: subject.trim(),
+        message: message.trim(),
+      })
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json({ complaint: data });
+  } catch (err) {
+    console.error('[complaints] Failed to file complaint:', err.message || err);
+    res.status(500).json({ error: 'Failed to file complaint' });
+  }
+});
+
+// GET /api/complaints/mine — list complaints filed by the current user
+app.get('/api/complaints/mine', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const { data, error } = await supabase
+      .from('complaints')
+      .select('*')
+      .eq('filed_by', user.id)
+      .order('created_at', { ascending: false });
+
+    if (error) throw error;
+    res.json({ complaints: data || [] });
+  } catch (err) {
+    console.error('[complaints] Failed to list complaints:', err.message || err);
+    res.status(500).json({ error: 'Failed to list complaints' });
+  }
+});
+
+// GET /api/admin/complaints — admin view of all complaints (filterable by org, status)
+app.get('/api/admin/complaints', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    let query = supabase
+      .from('complaints')
+      .select('*, organizations(name)')
+      .order('created_at', { ascending: false });
+
+    if (req.query.organization_id) {
+      query = query.eq('organization_id', req.query.organization_id);
+    }
+    if (req.query.status) {
+      query = query.eq('status', req.query.status);
+    }
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    // Enrich with user emails
+    const allUsers = await listUsers(200);
+    const enriched = (data || []).map((c) => {
+      const filer = allUsers.find((u) => u.id === c.filed_by);
+      const against = c.against_user_id ? allUsers.find((u) => u.id === c.against_user_id) : null;
+      return {
+        ...c,
+        filed_by_email: filer?.email || c.filed_by,
+        against_user_email: against?.email || c.against_user_id || null,
+        organizationName: c.organizations?.name || '',
+      };
+    });
+
+    res.json({ complaints: enriched });
+  } catch (err) {
+    console.error('[admin] Failed to list complaints:', err.message || err);
+    res.status(500).json({ error: 'Failed to list complaints' });
+  }
+});
+
+// PATCH /api/admin/complaints/:id — admin updates a complaint (status, admin_response)
+// Body: { status?, admin_response? }
+app.patch('/api/admin/complaints/:id', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const admin = await requireAdmin(user.id, res);
+    if (!admin) return;
+
+    const updates = { updated_at: new Date().toISOString() };
+    if (req.body.status) updates.status = req.body.status;
+    if (req.body.admin_response !== undefined) updates.admin_response = req.body.admin_response;
+
+    if (!req.body.status && req.body.admin_response === undefined) {
+      res.status(400).json({ error: 'No fields to update' });
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('complaints')
+      .update(updates)
+      .eq('id', req.params.id)
+      .select('*')
+      .single();
+
+    if (error) throw error;
+    res.json({ complaint: data });
+  } catch (err) {
+    console.error('[admin] Failed to update complaint:', err.message || err);
+    res.status(500).json({ error: 'Failed to update complaint' });
+  }
+});
+
 // Lightweight health check so we can quickly verify the HTTP layer is alive.
 app.get('/health', (_req, res) => {
   res.json({ status: 'ok' });
