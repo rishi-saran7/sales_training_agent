@@ -101,6 +101,16 @@ async function getOrgMembers(orgId) {
   return Array.isArray(data) ? data : [];
 }
 
+async function getTrainerEmailForOrg(orgId) {
+  const members = await getOrgMembers(orgId);
+  const trainer = members.find((member) => member.role === 'trainer');
+  if (!trainer?.user_id) return null;
+
+  const allUsers = await listUsers(200);
+  const match = allUsers.find((candidate) => candidate.id === trainer.user_id);
+  return match?.email || null;
+}
+
 async function listUsers(perPage = 200) {
   if (!supabase?.auth?.admin) {
     throw new Error('Supabase admin API unavailable');
@@ -677,6 +687,28 @@ app.get('/api/org/me', async (req, res) => {
   }
 });
 
+app.get('/api/org/trainer', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  try {
+    const membership = await getMembership(user.id);
+    if (!membership || membership.role !== 'trainee') {
+      res.json({ trainerEmail: null, organizationName: null });
+      return;
+    }
+
+    const trainerEmail = await getTrainerEmailForOrg(membership.organization_id);
+    res.json({
+      trainerEmail: trainerEmail || null,
+      organizationName: membership.organizations?.name || 'Organization',
+    });
+  } catch (err) {
+    console.error('[org] Failed to load trainer email:', err.message || err);
+    res.status(500).json({ error: 'Failed to load trainer email' });
+  }
+});
+
 app.get('/api/org/unassigned', async (req, res) => {
   const user = await requireUser(req, res);
   if (!user) return;
@@ -845,6 +877,99 @@ app.get('/api/org/team', async (req, res) => {
   } catch (err) {
     console.error('[org] Failed to fetch team data:', err.message || err);
     res.status(500).json({ error: 'Failed to fetch team data' });
+  }
+});
+
+app.get('/api/org/trainees/:userId/analytics', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const traineeId = req.params.userId;
+  if (!traineeId) {
+    res.status(400).json({ error: 'Missing trainee id' });
+    return;
+  }
+
+  try {
+    const membership = await requireTrainer(user.id, res);
+    if (!membership) return;
+
+    const { data: traineeMember } = await supabase
+      .from('organization_members')
+      .select('id')
+      .eq('organization_id', membership.organization_id)
+      .eq('user_id', traineeId)
+      .eq('role', 'trainee')
+      .maybeSingle();
+
+    if (!traineeMember) {
+      res.status(403).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const analytics = await fetchAnalyticsData([traineeId]);
+    const allUsers = await listUsers(200);
+    const emailMap = new Map(allUsers.map((candidate) => [candidate.id, candidate.email]));
+    const traineeEmail = emailMap.get(traineeId) || 'Unknown';
+
+    res.json({
+      traineeId,
+      traineeEmail,
+      summary: analytics.summary,
+      trend: analytics.trend,
+      byScenario: analytics.byScenario,
+      range: analytics.range,
+    });
+  } catch (err) {
+    console.error('[org] Failed to fetch trainee analytics:', err.message || err);
+    res.status(500).json({ error: 'Failed to fetch trainee analytics' });
+  }
+});
+
+app.get('/api/org/trainees/:userId/sessions', async (req, res) => {
+  const user = await requireUser(req, res);
+  if (!user) return;
+
+  const traineeId = req.params.userId;
+  if (!traineeId) {
+    res.status(400).json({ error: 'Missing trainee id' });
+    return;
+  }
+
+  try {
+    const membership = await requireTrainer(user.id, res);
+    if (!membership) return;
+
+    const { data: traineeMember } = await supabase
+      .from('organization_members')
+      .select('id')
+      .eq('organization_id', membership.organization_id)
+      .eq('user_id', traineeId)
+      .eq('role', 'trainee')
+      .maybeSingle();
+
+    if (!traineeMember) {
+      res.status(403).json({ error: 'Unauthorized' });
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from('call_sessions')
+      .select('id, scenario, call_duration, overall_score:feedback->>overall_score, created_at')
+      .eq('user_id', traineeId)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (error) {
+      console.error('[org] Failed to fetch trainee sessions:', error.message || error);
+      res.status(500).json({ error: 'Failed to fetch trainee sessions' });
+      return;
+    }
+
+    res.json({ sessions: data || [] });
+  } catch (err) {
+    console.error('[org] Failed to fetch trainee sessions:', err.message || err);
+    res.status(500).json({ error: 'Failed to fetch trainee sessions' });
   }
 });
 
