@@ -528,6 +528,17 @@ export default function AnalyticsPage() {
                           <span style={{ fontSize: "0.85rem", opacity: 0.75 }}>
                             Sessions: {member.sessionCount} · Overall {member.avgOverallScore.toFixed(2)} · Objection {member.avgObjectionHandling.toFixed(2)} · Clarity {member.avgCommunicationClarity.toFixed(2)} · Confidence {member.avgConfidence.toFixed(2)}
                           </span>
+                          <Link
+                            href={`/analytics/trainee/${member.user_id}`}
+                            style={{
+                              fontSize: "0.85rem",
+                              color: "#7dd3fc",
+                              textDecoration: "none",
+                              fontWeight: 600,
+                            }}
+                          >
+                            View detailed analytics
+                          </Link>
                         </div>
                       ))}
                     </div>

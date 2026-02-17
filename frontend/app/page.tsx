@@ -153,6 +153,8 @@ export default function HomePage() {
   const [roleChecking, setRoleChecking] = useState<boolean>(true);
   const [authToken, setAuthToken] = useState<string>("");
   const [authEmail, setAuthEmail] = useState<string>("");
+  const [trainerEmail, setTrainerEmail] = useState<string>("");
+  const [organizationName, setOrganizationName] = useState<string>("");
   const [difficultyLevel, setDifficultyLevel] = useState<string>("");
   const [autoDifficultyEnabled, setAutoDifficultyEnabled] = useState<boolean>(true);
 
@@ -346,12 +348,16 @@ export default function HomePage() {
       if (!session) {
         setAuthLoading(false);
         setAuthToken("");
+        setTrainerEmail("");
+        setOrganizationName("");
         router.push("/login");
         return;
       }
       authTokenRef.current = session.access_token;
       setAuthToken(session.access_token);
       setAuthEmail(session.user.email || "");
+      setTrainerEmail("");
+      setOrganizationName("");
       sendAuthToken(session.access_token);
       setAuthLoading(false);
     });
@@ -360,6 +366,8 @@ export default function HomePage() {
       if (!session) {
         authTokenRef.current = "";
         setAuthToken("");
+        setTrainerEmail("");
+        setOrganizationName("");
         setAuthLoading(false);
         router.push("/login");
         return;
@@ -367,6 +375,8 @@ export default function HomePage() {
       authTokenRef.current = session.access_token;
       setAuthToken(session.access_token);
       setAuthEmail(session.user.email || "");
+      setTrainerEmail("");
+      setOrganizationName("");
       sendAuthToken(session.access_token);
       setAuthLoading(false);
     });
@@ -376,6 +386,33 @@ export default function HomePage() {
       authListener?.subscription.unsubscribe();
     };
   }, [router]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function loadTrainerInfo() {
+      if (authLoading || !authToken) return;
+      try {
+        const response = await fetch(`${API_BASE}/api/org/trainer`, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        });
+        if (!response.ok) return;
+        const payload = await response.json();
+        if (active) {
+          setTrainerEmail(payload?.trainerEmail || "");
+          setOrganizationName(payload?.organizationName || "");
+        }
+      } catch (err) {
+        console.error("Failed to load trainer info", err);
+      }
+    }
+
+    loadTrainerInfo();
+
+    return () => {
+      active = false;
+    };
+  }, [authLoading, authToken]);
 
   useEffect(() => {
     // Establish the live WebSocket link to the backend agent gateway.
@@ -1210,6 +1247,12 @@ export default function HomePage() {
           </button>
           {authEmail && (
             <span style={{ fontSize: "0.8rem", opacity: 0.75 }}>{authEmail}</span>
+          )}
+          {trainerEmail && (
+            <span style={{ fontSize: "0.8rem", opacity: 0.7 }}>Trainer: {trainerEmail}</span>
+          )}
+          {organizationName && (
+            <span style={{ fontSize: "0.8rem", opacity: 0.7 }}>Org: {organizationName}</span>
           )}
         </div>
         <div style={{ marginTop: "1rem", display: "flex", gap: "0.75rem", alignItems: "center" }}>
