@@ -81,6 +81,15 @@ export default function AnalyticsPage() {
   const [teamLoading, setTeamLoading] = useState<boolean>(false);
   const [teamError, setTeamError] = useState<string>("");
 
+  // Complaint modal state (trainer can file complaints against trainees)
+  const [showComplaintModal, setShowComplaintModal] = useState(false);
+  const [complaintSubject, setComplaintSubject] = useState("");
+  const [complaintMessage, setComplaintMessage] = useState("");
+  const [complaintAgainst, setComplaintAgainst] = useState("");
+  const [complaintSending, setComplaintSending] = useState(false);
+  const [complaintSuccess, setComplaintSuccess] = useState("");
+  const [complaintError, setComplaintError] = useState("");
+
   useEffect(() => {
     let active = true;
 
@@ -412,6 +421,49 @@ export default function AnalyticsPage() {
             {authEmail && (
               <span style={{ marginLeft: "0.75rem", fontSize: "0.8rem", opacity: 0.75 }}>{authEmail}</span>
             )}
+            {role === "trainer" && (
+              <>
+                <a
+                  href="/messages"
+                  style={{
+                    marginLeft: "0.75rem",
+                    padding: "0.45rem 0.85rem",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(14,165,233,0.3)",
+                    background: "rgba(14, 165, 233, 0.15)",
+                    color: "#93c5fd",
+                    textDecoration: "none",
+                    fontSize: "0.85rem",
+                    fontWeight: 600,
+                  }}
+                >
+                  Messages
+                </a>
+                <button
+                  onClick={() => {
+                    setShowComplaintModal(true);
+                    setComplaintSubject("");
+                    setComplaintMessage("");
+                    setComplaintAgainst("");
+                    setComplaintSuccess("");
+                    setComplaintError("");
+                  }}
+                  style={{
+                    marginLeft: "0.75rem",
+                    padding: "0.45rem 0.85rem",
+                    borderRadius: "999px",
+                    border: "1px solid rgba(239,68,68,0.3)",
+                    background: "rgba(239, 68, 68, 0.2)",
+                    color: "#fca5a5",
+                    cursor: "pointer",
+                    fontSize: "0.85rem",
+                    fontWeight: 600,
+                  }}
+                >
+                  Report Issue
+                </button>
+              </>
+            )}
           </div>
         </header>
 
@@ -693,6 +745,158 @@ export default function AnalyticsPage() {
           </>
         )}
       </div>
+
+      {/* Complaint Modal for Trainers */}
+      {showComplaintModal && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            bottom: 0,
+            background: "rgba(0,0,0,0.6)",
+            display: "flex",
+            alignItems: "center",
+            justifyContent: "center",
+            zIndex: 9999,
+          }}
+          onClick={() => setShowComplaintModal(false)}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: "90%",
+              maxWidth: "500px",
+              padding: "2rem",
+              borderRadius: "18px",
+              background: "#0f172a",
+              border: "1px solid rgba(239,68,68,0.25)",
+              display: "flex",
+              flexDirection: "column",
+              gap: "1rem",
+            }}
+          >
+            <h2 style={{ margin: 0, fontSize: "1.3rem", fontWeight: 700, color: "#fca5a5" }}>Report Issue to Admin</h2>
+            <p style={{ margin: 0, fontSize: "0.85rem", opacity: 0.65 }}>File a complaint about a trainee. This will be sent to the administrator.</p>
+            {teamMembers.length > 0 && (
+              <select
+                value={complaintAgainst}
+                onChange={(e) => setComplaintAgainst(e.target.value)}
+                style={{
+                  padding: "0.6rem 0.9rem",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(148,163,184,0.2)",
+                  background: "rgba(2,6,23,0.6)",
+                  color: "#e2e8f0",
+                  fontSize: "0.9rem",
+                }}
+              >
+                <option value="">Select trainee (optional)</option>
+                {teamMembers.map((m) => (
+                  <option key={m.user_id} value={m.user_id}>{m.email}</option>
+                ))}
+              </select>
+            )}
+            <input
+              type="text"
+              value={complaintSubject}
+              onChange={(e) => setComplaintSubject(e.target.value)}
+              placeholder="Subject"
+              style={{
+                padding: "0.6rem 0.9rem",
+                borderRadius: "10px",
+                border: "1px solid rgba(148,163,184,0.2)",
+                background: "rgba(2,6,23,0.6)",
+                color: "#e2e8f0",
+                fontSize: "0.9rem",
+                outline: "none",
+              }}
+            />
+            <textarea
+              value={complaintMessage}
+              onChange={(e) => setComplaintMessage(e.target.value)}
+              placeholder="Describe the issue..."
+              rows={4}
+              style={{
+                padding: "0.6rem 0.9rem",
+                borderRadius: "10px",
+                border: "1px solid rgba(148,163,184,0.2)",
+                background: "rgba(2,6,23,0.6)",
+                color: "#e2e8f0",
+                fontSize: "0.9rem",
+                resize: "vertical",
+                outline: "none",
+              }}
+            />
+            {complaintError && <p style={{ margin: 0, color: "#fca5a5", fontSize: "0.85rem" }}>{complaintError}</p>}
+            {complaintSuccess && <p style={{ margin: 0, color: "#86efac", fontSize: "0.85rem" }}>{complaintSuccess}</p>}
+            <div style={{ display: "flex", gap: "0.75rem", justifyContent: "flex-end" }}>
+              <button
+                onClick={() => setShowComplaintModal(false)}
+                style={{
+                  padding: "0.5rem 1rem",
+                  borderRadius: "10px",
+                  border: "1px solid rgba(255,255,255,0.2)",
+                  background: "transparent",
+                  color: "#e2e8f0",
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                Cancel
+              </button>
+              <button
+                onClick={async () => {
+                  if (!complaintSubject.trim() || !complaintMessage.trim()) {
+                    setComplaintError("Subject and message are required.");
+                    return;
+                  }
+                  setComplaintSending(true);
+                  setComplaintError("");
+                  try {
+                    const body: Record<string, string> = {
+                      subject: complaintSubject.trim(),
+                      message: complaintMessage.trim(),
+                    };
+                    if (complaintAgainst) body.againstUserId = complaintAgainst;
+                    const res = await fetch(`${API_BASE}/api/complaints`, {
+                      method: "POST",
+                      headers: {
+                        Authorization: `Bearer ${authToken}`,
+                        "Content-Type": "application/json",
+                      },
+                      body: JSON.stringify(body),
+                    });
+                    if (!res.ok) throw new Error("Failed");
+                    setComplaintSuccess("Complaint submitted successfully!");
+                    setComplaintSubject("");
+                    setComplaintMessage("");
+                    setComplaintAgainst("");
+                    setTimeout(() => setShowComplaintModal(false), 1500);
+                  } catch {
+                    setComplaintError("Failed to submit complaint. Please try again.");
+                  } finally {
+                    setComplaintSending(false);
+                  }
+                }}
+                disabled={complaintSending}
+                style={{
+                  padding: "0.5rem 1rem",
+                  borderRadius: "10px",
+                  border: "none",
+                  background: complaintSending ? "#374151" : "#ef4444",
+                  color: "white",
+                  cursor: complaintSending ? "not-allowed" : "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                {complaintSending ? "Sending..." : "Submit Complaint"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </main>
   );
 }

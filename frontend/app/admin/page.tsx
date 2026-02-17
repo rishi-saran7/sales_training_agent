@@ -436,6 +436,34 @@ export default function AdminPage() {
             >
               Log out
             </button>
+            <a
+              href="/messages"
+              style={{
+                padding: "0.65rem 1.2rem",
+                borderRadius: "999px",
+                border: "1px solid rgba(14,165,233,0.3)",
+                background: "rgba(14, 165, 233, 0.15)",
+                color: "#93c5fd",
+                textDecoration: "none",
+                fontWeight: 600,
+              }}
+            >
+              Messages
+            </a>
+            <a
+              href="/admin/complaints"
+              style={{
+                padding: "0.65rem 1.2rem",
+                borderRadius: "999px",
+                border: "1px solid rgba(239,68,68,0.3)",
+                background: "rgba(239, 68, 68, 0.15)",
+                color: "#fca5a5",
+                textDecoration: "none",
+                fontWeight: 600,
+              }}
+            >
+              Complaints
+            </a>
           </div>
         </header>
 
