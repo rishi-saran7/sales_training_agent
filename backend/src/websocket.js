@@ -5,8 +5,10 @@ const { LlmClient } = require('./llmClient');
 const { TtsClient } = require('./ttsClient');
 const { supabase } = require('./lib/supabase');
 const { computeMetrics } = require('./metricsEngine');
+const { computeVoiceMetrics } = require('./voiceMetrics');
 
-const SILENCE_TIMEOUT_MS = 3000; // Wait 3 seconds after last speech to trigger LLM response.
+const SILENCE_TIMEOUT_MS = 5000; // Fallback: 5 seconds after last speech to trigger LLM response.
+                                 // Normally Deepgram's UtteranceEnd fires sooner (see utterance_end_ms).
 const COACH_HINT_COOLDOWN_MS = 10000;
 const COACHING_SYSTEM_PROMPT =
   'You are a live sales coach.\n' +
@@ -71,11 +73,16 @@ const BASE_CUSTOMER_PROMPT =
   'Never pitch, offer services, or describe products as if they are yours.\n' +
   'If the trainee is vague (e.g., "services"), ask what they mean and request specifics.\n' +
   'IMPORTANT: Do NOT make assumptions about vague or unclear statements.\n' +
-  'When the salesperson is unclear, vague, or rambling, respond with:\n' +
-  '- "I didn\'t catch that. Can you repeat?"\n' +
+  'IMPORTANT: This is a VOICE conversation. The trainee\'s text comes from speech-to-text transcription.\n' +
+  'Expect natural speech patterns: filler words ("um", "uh"), minor grammatical errors, repeated words, and informal phrasing.\n' +
+  'These are NORMAL in spoken language — do NOT treat them as unclear or confusing.\n' +
+  'Only ask for clarification when the actual MEANING or INTENT is genuinely unclear, not because of speech disfluencies.\n' +
+  'If the trainee provides substantive information (product names, pricing tiers, features, numbers), acknowledge it and respond as a customer would — ask follow-up questions, raise concerns, or push back on specifics.\n' +
+  'When the salesperson is truly unclear or vague (e.g., gives no real information, just says "we have solutions"), respond with:\n' +
   '- "I\'m not sure what you mean. Can you be more specific?"\n' +
   '- "Sorry, can you clarify what you\'re offering?"\n' +
   '- "I need you to be clearer about..."\n' +
+  'Do NOT use "I didn\'t catch that" unless the previous message was extremely short (under 5 words) or truly unintelligible.\n' +
   'If you need details, ask as a customer (e.g., "What does that include?", "How much does it cost?", "What is the timeline?").\n' +
   'Ask direct follow-up questions when information is missing.\n' +
   'Challenge vague pitches by asking for concrete details.\n' +
@@ -258,6 +265,10 @@ function setupWebsocket(server) {
     let interruptionCount = 0;
     let turnTimestamps = []; // {role, timestamp} per conversation turn
     let lastUserTurnEndTime = null; // for response latency measurement
+
+    // ── Voice / audio intelligence tracking ─────────────────────
+    let speakingSegments = []; // {startMs, endMs, samples, sampleRate}
+    let sttEvents = [];        // {text, timestamp, confidence}
 
     function resetConversationForScenario(scenario) {
       conversation = [
@@ -554,6 +565,30 @@ function setupWebsocket(server) {
         console.error('[metrics] Failed to compute metrics:', metricsErr.message || metricsErr);
       }
 
+      // Compute voice / audio intelligence metrics.
+      let audioMetrics = null;
+      try {
+        // Count user words from conversation for energy score.
+        let totalUserWords = 0;
+        for (const msg of conversation) {
+          if (msg.role === 'user') {
+            totalUserWords += (msg.content || '').split(/\s+/).filter(Boolean).length;
+          }
+        }
+
+        audioMetrics = computeVoiceMetrics({
+          speakingSegments,
+          sttEvents,
+          callDurationMs,
+          interruptionCount,
+          turnTimestamps,
+          totalUserWords,
+        });
+        console.log(`[voice-metrics] Speaking rate: ${audioMetrics.speaking_rate_wpm} wpm, Confidence: ${audioMetrics.confidence_score}/10, Clarity: ${audioMetrics.vocal_clarity_score}/10, Energy: ${audioMetrics.energy_score}/10`);
+      } catch (voiceErr) {
+        console.error('[voice-metrics] Failed to compute voice metrics:', voiceErr.message || voiceErr);
+      }
+
       // Extract conversation transcript for analysis.
       const transcriptLines = [];
       for (let i = 1; i < conversation.length; i++) {
@@ -620,6 +655,7 @@ function setupWebsocket(server) {
             type: MESSAGE_TYPES.CALL_FEEDBACK,
             payload: feedbackData,
             conversationMetrics,
+            audioMetrics,
             callDurationMs,
             turnCount,
           })
@@ -632,6 +668,7 @@ function setupWebsocket(server) {
             difficulty_averages: difficultyAverages,
             difficulty_auto: autoDifficultyEnabled,
             conversation_metrics: conversationMetrics,
+            audio_metrics: audioMetrics,
           };
           supabase
             .from('call_sessions')
@@ -832,23 +869,51 @@ function setupWebsocket(server) {
                       text: data.text,
                     })
                   );
+
+                  // Track STT event for voice metrics.
+                  sttEvents.push({
+                    text: data.text || '',
+                    timestamp: Date.now(),
+                    confidence: data.confidence != null ? data.confidence : null,
+                  });
+
                   // Accumulate transcript and reset silence timer.
                   const cleaned = (data.text || '').trim();
                   if (cleaned) {
                     accumulatedTranscript = accumulatedTranscript ? `${accumulatedTranscript} ${cleaned}` : cleaned;
                     generateCoachHint(accumulatedTranscript);
                   }
-                  // Clear previous timer and start new 3-second countdown.
+                  // Reset the fallback silence timer (fires only if UtteranceEnd never arrives).
                   if (silenceTimer) clearTimeout(silenceTimer);
                   silenceTimer = setTimeout(() => {
                     silenceTimer = null;
-                    if (accumulatedTranscript) {
+                    // Only flush if the user has stopped recording (pressed Stop Speaking).
+                    // While the mic is active, we keep accumulating — USER_AUDIO_END will flush.
+                    if (accumulatedTranscript && !streamState.active) {
+                      console.log('[ws] Fallback silence timer fired — flushing transcript');
                       const toSend = accumulatedTranscript;
                       accumulatedTranscript = '';
                       queueTranscript(toSend);
                       coachHintSentForTurn = false;
                     }
                   }, SILENCE_TIMEOUT_MS);
+                  break;
+                }
+                case 'stt.utterance_end': {
+                  // Deepgram detected 1.5s of genuine audio silence — the user
+                  // has finished speaking.  Flush the accumulated transcript so
+                  // the agent responds promptly.
+                  if (silenceTimer) {
+                    clearTimeout(silenceTimer);
+                    silenceTimer = null;
+                  }
+                  if (accumulatedTranscript) {
+                    console.log('[ws] Deepgram UtteranceEnd — flushing transcript');
+                    const toSend = accumulatedTranscript;
+                    accumulatedTranscript = '';
+                    queueTranscript(toSend);
+                    coachHintSentForTurn = false;
+                  }
                   break;
                 }
                 default:
@@ -922,6 +987,16 @@ function setupWebsocket(server) {
               approxDurationMs !== null ? `${approxDurationMs} ms` : 'unknown'
             } (wall clock ${elapsedMs} ms)`
           );
+
+          // Track speaking segment for voice metrics.
+          if (streamState.startedAt) {
+            speakingSegments.push({
+              startMs: streamState.startedAt,
+              endMs: Date.now(),
+              samples: streamState.totalSamples,
+              sampleRate: streamState.sampleRate,
+            });
+          }
 
           // Close Deepgram stream after user finishes speaking.
           if (deepgramClient && deepgramClient.connected) {
@@ -1020,6 +1095,8 @@ function setupWebsocket(server) {
           interruptionCount = 0;
           turnTimestamps = [];
           lastUserTurnEndTime = null;
+          speakingSegments = [];
+          sttEvents = [];
           if (deepgramClient) {
             deepgramClient.close();
             deepgramClient = null;

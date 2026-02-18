@@ -7,6 +7,7 @@ const PDFDocument = require('pdfkit');
 const { setupWebsocket } = require('./websocket');
 const { supabase } = require('./lib/supabase');
 const { aggregateMetrics } = require('./metricsEngine');
+const { aggregateVoiceMetrics } = require('./voiceMetrics');
 
 // Use a fixed port so the frontend knows where to connect during local development.
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
@@ -497,6 +498,15 @@ async function fetchAnalyticsData(userIds) {
     .filter(Boolean);
   const conversationMetrics = aggregateMetrics(metricsList);
 
+  // Aggregate voice / audio intelligence metrics from feedback JSONB.
+  const voiceMetricsList = rows
+    .map((row) => {
+      const fb = row.feedback;
+      return fb && fb.audio_metrics ? fb.audio_metrics : null;
+    })
+    .filter(Boolean);
+  const voiceMetrics = aggregateVoiceMetrics(voiceMetricsList);
+
   return {
     summary: {
       totalSessions: totals.count,
@@ -510,6 +520,7 @@ async function fetchAnalyticsData(userIds) {
     trend,
     byScenario,
     conversationMetrics,
+    voiceMetrics,
     range: {
       start: rows[0]?.created_at || null,
       end: rows[rows.length - 1]?.created_at || null,
@@ -2123,6 +2134,23 @@ app.get('/api/report/analytics', async (req, res) => {
       doc.text(`Sessions with Closing Attempts: ${cm.closing_session_pct}%`);
     }
 
+    // Voice / Audio Intelligence Averages.
+    if (analytics.voiceMetrics) {
+      const vm = analytics.voiceMetrics;
+      addSectionTitle(doc, 'Voice Intelligence (Averages)');
+      doc.text(`Avg Speaking Rate: ${vm.avg_speaking_rate_wpm} wpm`);
+      doc.text(`Avg Silence Duration: ${(vm.avg_silence_duration_ms / 1000).toFixed(1)}s`);
+      doc.text(`Avg Pause Length: ${(vm.avg_pause_ms / 1000).toFixed(1)}s`);
+      doc.text(`Avg Hesitation Count: ${vm.avg_hesitation_count}`);
+      doc.text(`Avg Hesitation Rate: ${vm.avg_hesitation_rate}%`);
+      doc.text(`Avg Confidence Score: ${vm.avg_confidence_score}/10`);
+      doc.text(`Avg Vocal Clarity Score: ${vm.avg_vocal_clarity_score}/10`);
+      doc.text(`Avg Energy Score: ${vm.avg_energy_score}/10`);
+      if (vm.avg_stt_confidence != null) {
+        doc.text(`Avg STT Confidence: ${(vm.avg_stt_confidence * 100).toFixed(0)}%`);
+      }
+    }
+
     doc.end();
   } catch (err) {
     console.error('[report] Failed to generate analytics report:', err.message || err);
@@ -2256,6 +2284,23 @@ app.get('/api/report/:sessionId', async (req, res) => {
         doc.font('Helvetica-Bold').fontSize(11).text('Topic Detection:');
         doc.font('Helvetica').fontSize(11);
         addBulletList(doc, topics);
+      }
+    }
+
+    // Voice / Audio Intelligence Metrics section.
+    const vm = feedback.audio_metrics;
+    if (vm) {
+      addSectionTitle(doc, 'Voice Intelligence');
+      doc.text(`Speaking Rate: ${vm.speaking_rate_wpm} wpm (${vm.pace_label || 'unknown'})`);
+      doc.text(`Speaking Duration: ${(vm.speaking_duration_ms / 1000).toFixed(1)}s`);
+      doc.text(`Silence Duration: ${(vm.silence_duration_ms / 1000).toFixed(1)}s`);
+      doc.text(`Avg Pause Length: ${(vm.avg_pause_ms / 1000).toFixed(1)}s`);
+      doc.text(`Hesitations: ${vm.hesitation_count} (${vm.hesitation_rate}% of words)`);
+      doc.text(`Confidence Score: ${vm.confidence_score}/10`);
+      doc.text(`Vocal Clarity Score: ${vm.vocal_clarity_score}/10`);
+      doc.text(`Energy Score: ${vm.energy_score}/10`);
+      if (vm.avg_stt_confidence != null) {
+        doc.text(`STT Confidence: ${(vm.avg_stt_confidence * 100).toFixed(0)}%`);
       }
     }
 

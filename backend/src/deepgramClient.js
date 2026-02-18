@@ -23,6 +23,9 @@ class DeepgramClient {
         smart_format: 'true',
         model: 'nova-2',
         punctuate: 'true',
+        filler_words: 'true',    // Keep "um", "uh", etc. in the transcript for hesitation detection.
+        utterance_end_ms: '1500',  // Deepgram waits 1.5s of silence before emitting UtteranceEnd.
+        endpointing: '500',       // 500ms of silence within an utterance to finalise the sentence.
       });
 
       console.log('[deepgram] Connecting to realtime endpoint...');
@@ -64,18 +67,49 @@ class DeepgramClient {
       return;
     }
 
-    if (message.type !== 'Results') return;
+    if (message.type !== 'Results') {
+      this._handleMetaMessage(message);
+      return;
+    }
     const channel = message.channel || {};
     const alt = (channel.alternatives && channel.alternatives[0]) || {};
     const transcript = (alt.transcript || '').trim();
     if (!transcript) return; // ignore empty
 
+    // Extract average word-level confidence if available.
+    let avgConfidence = null;
+    const words = alt.words;
+    if (Array.isArray(words) && words.length > 0) {
+      let confSum = 0;
+      let confCount = 0;
+      for (const w of words) {
+        if (typeof w.confidence === 'number') {
+          confSum += w.confidence;
+          confCount++;
+        }
+      }
+      if (confCount > 0) {
+        avgConfidence = confSum / confCount;
+      }
+    }
+
     const isFinal = Boolean(message.is_final);
     if (isFinal) {
       console.log(`[deepgram] Final transcript: "${transcript}"`);
-      this.onEvent('stt.final', { text: transcript });
+      this.onEvent('stt.final', { text: transcript, confidence: avgConfidence });
     } else {
       this.onEvent('stt.partial', { text: transcript });
+    }
+  }
+
+  /**
+   * Handle non-Results messages (e.g. UtteranceEnd).
+   * Called from the main _handleMessage after the Results check.
+   */
+  _handleMetaMessage(message) {
+    if (message.type === 'UtteranceEnd') {
+      console.log('[deepgram] UtteranceEnd detected');
+      this.onEvent('stt.utterance_end', {});
     }
   }
 
