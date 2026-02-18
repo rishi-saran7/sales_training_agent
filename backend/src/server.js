@@ -6,6 +6,7 @@ const cors = require('cors');
 const PDFDocument = require('pdfkit');
 const { setupWebsocket } = require('./websocket');
 const { supabase } = require('./lib/supabase');
+const { aggregateMetrics } = require('./metricsEngine');
 
 // Use a fixed port so the frontend knows where to connect during local development.
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
@@ -404,7 +405,7 @@ async function fetchAnalyticsData(userIds) {
   const { data, error } = await supabase
     .from('call_sessions')
     .select(
-      'scenario, created_at, overall_score:feedback->>overall_score, objection_handling:feedback->>objection_handling, communication_clarity:feedback->>communication_clarity, confidence:feedback->>confidence'
+      'scenario, created_at, feedback, overall_score:feedback->>overall_score, objection_handling:feedback->>objection_handling, communication_clarity:feedback->>communication_clarity, confidence:feedback->>confidence'
     )
     .in('user_id', ids)
     .order('created_at', { ascending: true })
@@ -487,6 +488,15 @@ async function fetchAnalyticsData(userIds) {
     count: bucket.count,
   }));
 
+  // Aggregate conversation intelligence metrics from feedback JSONB.
+  const metricsList = rows
+    .map((row) => {
+      const fb = row.feedback;
+      return fb && fb.conversation_metrics ? fb.conversation_metrics : null;
+    })
+    .filter(Boolean);
+  const conversationMetrics = aggregateMetrics(metricsList);
+
   return {
     summary: {
       totalSessions: totals.count,
@@ -499,6 +509,7 @@ async function fetchAnalyticsData(userIds) {
     },
     trend,
     byScenario,
+    conversationMetrics,
     range: {
       start: rows[0]?.created_at || null,
       end: rows[rows.length - 1]?.created_at || null,
@@ -918,6 +929,7 @@ app.get('/api/org/trainees/:userId/analytics', async (req, res) => {
       summary: analytics.summary,
       trend: analytics.trend,
       byScenario: analytics.byScenario,
+      conversationMetrics: analytics.conversationMetrics,
       range: analytics.range,
     });
   } catch (err) {
@@ -2091,6 +2103,26 @@ app.get('/api/report/analytics', async (req, res) => {
       addBulletList(doc, commonSuggestions);
     }
 
+    // Conversation Intelligence Averages.
+    if (analytics.conversationMetrics) {
+      const cm = analytics.conversationMetrics;
+      addSectionTitle(doc, 'Conversation Intelligence (Averages)');
+      doc.text(`Avg Talk Ratio: ${(cm.avg_talk_ratio * 100).toFixed(0)}%`);
+      doc.text(`Avg Questions Asked: ${cm.avg_user_questions}`);
+      doc.text(`Avg Filler Word Rate: ${cm.avg_filler_word_rate}%`);
+      doc.text(`Avg Turn Length: ${cm.avg_turn_length} words`);
+      doc.text(`Avg Interruptions: ${cm.avg_interruption_count}`);
+      if (cm.avg_response_latency_ms != null) {
+        doc.text(`Avg Response Latency: ${(cm.avg_response_latency_ms / 1000).toFixed(1)}s`);
+      }
+      doc.text(`Avg Speaking Pace: ${cm.avg_words_per_minute} wpm`);
+      doc.text(`Avg Engagement Score: ${cm.avg_engagement_score}/10`);
+      doc.text(`Sessions with Objections: ${cm.customer_objection_pct}%`);
+      doc.text(`Sessions with Pricing Discussion: ${cm.pricing_session_pct}%`);
+      doc.text(`Sessions with Competitor Mentions: ${cm.competitor_session_pct}%`);
+      doc.text(`Sessions with Closing Attempts: ${cm.closing_session_pct}%`);
+    }
+
     doc.end();
   } catch (err) {
     console.error('[report] Failed to generate analytics report:', err.message || err);
@@ -2197,6 +2229,36 @@ app.get('/api/report/:sessionId', async (req, res) => {
     addSectionTitle(doc, 'Skill Snapshot');
     drawBarChart(doc, skillChart, { width: 420, height: 120, barColor: '#2563eb' });
 
+    // Conversation Intelligence Metrics section.
+    const cm = feedback.conversation_metrics;
+    if (cm) {
+      addSectionTitle(doc, 'Conversation Intelligence');
+      doc.text(`Talk Ratio (Trainee): ${(cm.talk_ratio * 100).toFixed(0)}%`);
+      doc.text(`Questions Asked: ${cm.user_questions_asked}`);
+      doc.text(`Filler Words: ${cm.filler_word_count} (${cm.filler_word_rate}% of words)`);
+      doc.text(`Avg Turn Length: ${cm.avg_turn_length} words`);
+      doc.text(`Interruptions: ${cm.interruption_count}`);
+      if (cm.avg_response_latency_ms != null) {
+        doc.text(`Avg Response Latency: ${(cm.avg_response_latency_ms / 1000).toFixed(1)}s`);
+      }
+      doc.text(`Speaking Pace: ${cm.user_words_per_minute} wpm`);
+      doc.text(`Engagement Score: ${cm.engagement_score}/10`);
+      doc.text(`Rapport Phrases Used: ${cm.rapport_building_phrases}`);
+
+      const topics = [];
+      if (cm.objection_detected) topics.push('Trainee addressed objections');
+      if (cm.customer_raised_objection) topics.push('Customer raised objections');
+      if (cm.pricing_discussed) topics.push('Pricing discussed');
+      if (cm.competitor_mentioned) topics.push('Competitors mentioned');
+      if (cm.closing_attempted) topics.push('Closing attempted');
+      if (topics.length > 0) {
+        doc.moveDown(0.3);
+        doc.font('Helvetica-Bold').fontSize(11).text('Topic Detection:');
+        doc.font('Helvetica').fontSize(11);
+        addBulletList(doc, topics);
+      }
+    }
+
     addSectionTitle(doc, 'Transcript Summary');
     doc.text(summary);
 
@@ -2274,6 +2336,7 @@ app.get('/api/analytics', async (req, res) => {
       summary: analytics.summary,
       trend: analytics.trend,
       byScenario: analytics.byScenario,
+      conversationMetrics: analytics.conversationMetrics,
     });
   } catch (err) {
     console.error('[supabase] Failed to fetch analytics:', err.message || err);

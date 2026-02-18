@@ -4,6 +4,7 @@ const { DeepgramClient } = require('./deepgramClient');
 const { LlmClient } = require('./llmClient');
 const { TtsClient } = require('./ttsClient');
 const { supabase } = require('./lib/supabase');
+const { computeMetrics } = require('./metricsEngine');
 
 const SILENCE_TIMEOUT_MS = 3000; // Wait 3 seconds after last speech to trigger LLM response.
 const COACH_HINT_COOLDOWN_MS = 10000;
@@ -253,6 +254,11 @@ function setupWebsocket(server) {
     let currentDifficulty = DIFFICULTY_CONFIG.defaultLevel;
     let difficultyAverages = null;
 
+    // ── Conversation intelligence tracking ──────────────────────
+    let interruptionCount = 0;
+    let turnTimestamps = []; // {role, timestamp} per conversation turn
+    let lastUserTurnEndTime = null; // for response latency measurement
+
     function resetConversationForScenario(scenario) {
       conversation = [
         {
@@ -406,6 +412,8 @@ function setupWebsocket(server) {
       if (!text) return;
 
       conversation.push({ role: 'user', content: text });
+      lastUserTurnEndTime = Date.now();
+      turnTimestamps.push({ role: 'user', timestamp: lastUserTurnEndTime });
       const turnCount = Math.floor((conversation.length - 1) / 2);
       console.log(`[llm] Turn ${turnCount} user transcript: "${text}"`);
 
@@ -414,6 +422,7 @@ function setupWebsocket(server) {
         if (callEnded) return;
         const safeResponse = responseText || '...';
         conversation.push({ role: 'assistant', content: safeResponse });
+        turnTimestamps.push({ role: 'assistant', timestamp: Date.now() });
         console.log(`[llm] Turn ${turnCount} customer reply: "${safeResponse}"`);
 
         ws.send(
@@ -531,6 +540,20 @@ function setupWebsocket(server) {
 
       console.log(`[feedback] Generating feedback for ${turnCount} turns, ${callDurationMin} min call`);
 
+      // Compute programmatic conversation intelligence metrics.
+      let conversationMetrics = null;
+      try {
+        conversationMetrics = computeMetrics({
+          conversation,
+          callDurationMs,
+          interruptionCount,
+          turnTimestamps,
+        });
+        console.log(`[metrics] Talk ratio: ${conversationMetrics.talk_ratio}, Questions: ${conversationMetrics.user_questions_asked}, Engagement: ${conversationMetrics.engagement_score}`);
+      } catch (metricsErr) {
+        console.error('[metrics] Failed to compute metrics:', metricsErr.message || metricsErr);
+      }
+
       // Extract conversation transcript for analysis.
       const transcriptLines = [];
       for (let i = 1; i < conversation.length; i++) {
@@ -596,6 +619,7 @@ function setupWebsocket(server) {
           JSON.stringify({
             type: MESSAGE_TYPES.CALL_FEEDBACK,
             payload: feedbackData,
+            conversationMetrics,
             callDurationMs,
             turnCount,
           })
@@ -607,6 +631,7 @@ function setupWebsocket(server) {
             difficulty: currentDifficulty,
             difficulty_averages: difficultyAverages,
             difficulty_auto: autoDifficultyEnabled,
+            conversation_metrics: conversationMetrics,
           };
           supabase
             .from('call_sessions')
@@ -936,6 +961,7 @@ function setupWebsocket(server) {
         case MESSAGE_TYPES.USER_INTERRUPT: {
           // Barge-in: user is speaking while agent is playing audio.
           interrupted = true;
+          interruptionCount += 1;
           ttsSessionId += 1; // Invalidate any in-flight TTS chunk loop.
           agentSpeakingState = false;
           console.log('[barge-in] Interruption detected');
@@ -991,6 +1017,9 @@ function setupWebsocket(server) {
           agentSpeakingState = false;
           interruptNotified = false;
           callStartTime = Date.now();
+          interruptionCount = 0;
+          turnTimestamps = [];
+          lastUserTurnEndTime = null;
           if (deepgramClient) {
             deepgramClient.close();
             deepgramClient = null;
