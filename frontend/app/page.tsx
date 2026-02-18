@@ -57,6 +57,32 @@ type PastSession = {
   created_at: string;
 };
 
+type SessionConversationMetrics = {
+  talk_ratio: number;
+  user_word_count: number;
+  agent_word_count: number;
+  user_turn_count: number;
+  agent_turn_count: number;
+  user_questions_asked: number;
+  customer_questions_asked: number;
+  filler_word_count: number;
+  filler_word_rate: number;
+  avg_turn_length: number;
+  longest_monologue: number;
+  interruption_count: number;
+  avg_response_latency_ms: number | null;
+  user_words_per_minute: number;
+  engagement_score: number;
+  objection_detected: boolean;
+  customer_raised_objection: boolean;
+  pricing_discussed: boolean;
+  customer_raised_pricing: boolean;
+  competitor_mentioned: boolean;
+  customer_mentioned_competitor: boolean;
+  closing_attempted: boolean;
+  rapport_building_phrases: number;
+};
+
 type AgentMessage =
   | { type: typeof MESSAGE_TYPES.AGENT_CONNECTED; message: string }
   | { type: typeof MESSAGE_TYPES.DIFFICULTY_ASSIGNED; level?: string; averages?: Record<string, number | null>; autoEnabled?: boolean }
@@ -74,7 +100,7 @@ type AgentMessage =
   | { type: typeof MESSAGE_TYPES.STT_FINAL; text: string }
   | { type: typeof MESSAGE_TYPES.AGENT_TEXT; text: string }
   | { type: typeof MESSAGE_TYPES.COACH_HINT; text: string }
-  | { type: typeof MESSAGE_TYPES.CALL_FEEDBACK; payload: FeedbackPayload; callDurationMs: number; turnCount: number }
+  | { type: typeof MESSAGE_TYPES.CALL_FEEDBACK; payload: FeedbackPayload; conversationMetrics?: SessionConversationMetrics | null; callDurationMs: number; turnCount: number }
   | { type: string; [key: string]: unknown };
 
 function safeParse(raw: string): AgentMessage | null {
@@ -138,6 +164,7 @@ export default function HomePage() {
   const [callEnded, setCallEnded] = useState<boolean>(false);
   const [feedback, setFeedback] = useState<FeedbackPayload | null>(null);
   const [callMetrics, setCallMetrics] = useState<{ duration: number; turns: number } | null>(null);
+  const [sessionMetrics, setSessionMetrics] = useState<SessionConversationMetrics | null>(null);
   const [latestSessionId, setLatestSessionId] = useState<string | number | null>(null);
   const [scenarioId, setScenarioId] = useState<string>(SCENARIOS[0]?.id || "");
   const [scenarioLocked, setScenarioLocked] = useState<boolean>(false);
@@ -597,6 +624,9 @@ export default function HomePage() {
               duration: typeof parsed.callDurationMs === "number" ? parsed.callDurationMs : 0,
               turns: typeof parsed.turnCount === "number" ? parsed.turnCount : 0,
             });
+            if (parsed.conversationMetrics && typeof parsed.conversationMetrics === "object") {
+              setSessionMetrics(parsed.conversationMetrics as SessionConversationMetrics);
+            }
             setCallEnded(true);
             clearCoachHint();
             setLatestSessionId(null);
@@ -962,6 +992,7 @@ export default function HomePage() {
     setCallEnded(false);
     setFeedback(null);
     setCallMetrics(null);
+    setSessionMetrics(null);
     setConversation([]);
     setPartialTranscript("");
     setAgentSpeaking(false);
@@ -1072,6 +1103,58 @@ export default function HomePage() {
               </p>
             </div>
           </div>
+
+          {/* Conversation Intelligence Metrics */}
+          {sessionMetrics && (
+            <div style={{ marginBottom: "1.5rem" }}>
+              <h3 style={{ margin: "0 0 0.75rem", fontSize: "1.2rem", color: "#a78bfa" }}>Conversation Intelligence</h3>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.75rem", marginBottom: "1rem" }}>
+                <div style={{ padding: "0.75rem", background: "rgba(167,139,250,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Talk Ratio</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{(sessionMetrics.talk_ratio * 100).toFixed(0)}%</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(167,139,250,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Engagement</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionMetrics.engagement_score}/10</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(167,139,250,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Questions</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionMetrics.user_questions_asked}</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(167,139,250,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Filler Words</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionMetrics.filler_word_count}</p>
+                  <p style={{ margin: 0, fontSize: "0.65rem", opacity: 0.5 }}>{sessionMetrics.filler_word_rate}% of words</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(167,139,250,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Interruptions</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionMetrics.interruption_count}</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(167,139,250,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Pace</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionMetrics.user_words_per_minute} wpm</p>
+                </div>
+              </div>
+              {/* Topic Tags */}
+              <div style={{ display: "flex", flexWrap: "wrap", gap: "0.5rem" }}>
+                {sessionMetrics.customer_raised_objection && (
+                  <span style={{ padding: "0.3rem 0.65rem", borderRadius: "999px", background: "rgba(239,68,68,0.2)", fontSize: "0.75rem", border: "1px solid rgba(239,68,68,0.3)" }}>Objections Raised</span>
+                )}
+                {sessionMetrics.pricing_discussed && (
+                  <span style={{ padding: "0.3rem 0.65rem", borderRadius: "999px", background: "rgba(34,211,238,0.2)", fontSize: "0.75rem", border: "1px solid rgba(34,211,238,0.3)" }}>Pricing Discussed</span>
+                )}
+                {sessionMetrics.competitor_mentioned && (
+                  <span style={{ padding: "0.3rem 0.65rem", borderRadius: "999px", background: "rgba(251,191,36,0.2)", fontSize: "0.75rem", border: "1px solid rgba(251,191,36,0.3)" }}>Competitors Mentioned</span>
+                )}
+                {sessionMetrics.closing_attempted && (
+                  <span style={{ padding: "0.3rem 0.65rem", borderRadius: "999px", background: "rgba(16,185,129,0.2)", fontSize: "0.75rem", border: "1px solid rgba(16,185,129,0.3)" }}>Closing Attempted</span>
+                )}
+                {sessionMetrics.rapport_building_phrases > 0 && (
+                  <span style={{ padding: "0.3rem 0.65rem", borderRadius: "999px", background: "rgba(167,139,250,0.2)", fontSize: "0.75rem", border: "1px solid rgba(167,139,250,0.3)" }}>Rapport: {sessionMetrics.rapport_building_phrases} phrases</span>
+                )}
+              </div>
+            </div>
+          )}
 
           {feedback.strengths.length > 0 && (
             <div style={{ marginBottom: "1.5rem" }}>

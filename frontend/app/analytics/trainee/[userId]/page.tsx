@@ -10,6 +10,10 @@ import {
   CartesianGrid,
   Line,
   LineChart,
+  PolarAngleAxis,
+  PolarGrid,
+  Radar,
+  RadarChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -39,12 +43,34 @@ type AnalyticsScenario = {
   count: number;
 };
 
+type ConversationMetrics = {
+  avg_talk_ratio: number;
+  avg_user_questions: number;
+  avg_customer_questions: number;
+  avg_filler_word_count: number;
+  avg_filler_word_rate: number;
+  avg_turn_length: number;
+  avg_longest_monologue: number;
+  avg_interruption_count: number;
+  avg_engagement_score: number;
+  avg_response_latency_ms: number | null;
+  avg_words_per_minute: number;
+  avg_rapport_phrases: number;
+  objection_session_pct: number;
+  pricing_session_pct: number;
+  competitor_session_pct: number;
+  closing_session_pct: number;
+  customer_objection_pct: number;
+  total_sessions: number;
+};
+
 type TraineeAnalytics = {
   traineeId: string;
   traineeEmail: string;
   summary: AnalyticsSummary;
   trend: AnalyticsTrendPoint[];
   byScenario: AnalyticsScenario[];
+  conversationMetrics?: ConversationMetrics | null;
 };
 
 type SessionRow = {
@@ -342,6 +368,116 @@ export default function TraineeAnalyticsPage() {
                 </div>
               </div>
             </section>
+
+            {/* Conversation Intelligence Metrics */}
+            {analytics?.conversationMetrics && (
+              <>
+                <section>
+                  <h2 style={{ margin: "0 0 1rem", fontSize: "1.3rem", fontWeight: 700 }}>Conversation Intelligence</h2>
+                  <div
+                    style={{
+                      display: "grid",
+                      gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                      gap: "1rem",
+                    }}
+                  >
+                    {[
+                      { label: "Talk Ratio", value: `${(analytics.conversationMetrics.avg_talk_ratio * 100).toFixed(0)}%`, sub: "Trainee speaking share" },
+                      { label: "Engagement", value: `${analytics.conversationMetrics.avg_engagement_score}/10`, sub: "Composite score" },
+                      { label: "Questions Asked", value: `${analytics.conversationMetrics.avg_user_questions}`, sub: "Avg per session" },
+                      { label: "Filler Rate", value: `${analytics.conversationMetrics.avg_filler_word_rate}%`, sub: "Of total words" },
+                      { label: "Interruptions", value: `${analytics.conversationMetrics.avg_interruption_count}`, sub: "Avg per session" },
+                      { label: "Avg Turn Length", value: `${analytics.conversationMetrics.avg_turn_length} words`, sub: "Per trainee turn" },
+                      { label: "Speaking Pace", value: `${analytics.conversationMetrics.avg_words_per_minute} wpm`, sub: "Words per minute" },
+                      { label: "Response Latency", value: analytics.conversationMetrics.avg_response_latency_ms != null ? `${(analytics.conversationMetrics.avg_response_latency_ms / 1000).toFixed(1)}s` : "N/A", sub: "Avg delay" },
+                    ].map((item) => (
+                      <div
+                        key={item.label}
+                        style={{
+                          padding: "1.1rem",
+                          borderRadius: "14px",
+                          background: "rgba(15, 23, 42, 0.85)",
+                          border: "1px solid rgba(148, 163, 184, 0.15)",
+                        }}
+                      >
+                        <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6, textTransform: "uppercase", letterSpacing: "0.1em" }}>{item.label}</p>
+                        <p style={{ margin: "0.4rem 0 0", fontSize: "1.5rem", fontWeight: 700 }}>{item.value}</p>
+                        <p style={{ margin: "0.2rem 0 0", fontSize: "0.7rem", opacity: 0.5 }}>{item.sub}</p>
+                      </div>
+                    ))}
+                  </div>
+                </section>
+
+                <section
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))",
+                    gap: "1.5rem",
+                  }}
+                >
+                  <div
+                    style={{
+                      padding: "1.5rem",
+                      borderRadius: "18px",
+                      background: "rgba(15, 23, 42, 0.85)",
+                      border: "1px solid rgba(148, 163, 184, 0.15)",
+                    }}
+                  >
+                    <h2 style={{ margin: "0 0 1rem", fontSize: "1.2rem" }}>Topic Detection (% of sessions)</h2>
+                    <div style={{ width: "100%", height: "220px" }}>
+                      <ResponsiveContainer>
+                        <BarChart
+                          data={[
+                            { topic: "Objections", pct: analytics.conversationMetrics.customer_objection_pct },
+                            { topic: "Pricing", pct: analytics.conversationMetrics.pricing_session_pct },
+                            { topic: "Competitors", pct: analytics.conversationMetrics.competitor_session_pct },
+                            { topic: "Closing", pct: analytics.conversationMetrics.closing_session_pct },
+                          ]}
+                          layout="vertical"
+                          margin={{ left: 24 }}
+                        >
+                          <CartesianGrid strokeDasharray="3 3" stroke="#1f2a44" />
+                          <XAxis type="number" domain={[0, 100]} stroke="#94a3b8" tick={{ fontSize: 12 }} unit="%" />
+                          <YAxis type="category" dataKey="topic" stroke="#94a3b8" tick={{ fontSize: 12 }} width={100} />
+                          <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1f2a44" }} formatter={(v: number) => `${v}%`} />
+                          <Bar dataKey="pct" fill="#a78bfa" radius={[6, 6, 6, 6]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  <div
+                    style={{
+                      padding: "1.5rem",
+                      borderRadius: "18px",
+                      background: "rgba(15, 23, 42, 0.85)",
+                      border: "1px solid rgba(148, 163, 184, 0.15)",
+                    }}
+                  >
+                    <h2 style={{ margin: "0 0 1rem", fontSize: "1.2rem" }}>Conversation Quality Profile</h2>
+                    <div style={{ width: "100%", height: "280px" }}>
+                      <ResponsiveContainer>
+                        <RadarChart
+                          data={[
+                            { metric: "Engagement", value: analytics.conversationMetrics.avg_engagement_score },
+                            { metric: "Talk Balance", value: Math.min(10, (1 - Math.abs(analytics.conversationMetrics.avg_talk_ratio - 0.5) * 4) * 10) },
+                            { metric: "Questions", value: Math.min(10, analytics.conversationMetrics.avg_user_questions * 2) },
+                            { metric: "Rapport", value: Math.min(10, analytics.conversationMetrics.avg_rapport_phrases * 2) },
+                            { metric: "Fluency", value: Math.max(0, 10 - analytics.conversationMetrics.avg_filler_word_rate) },
+                          ]}
+                          outerRadius={90}
+                        >
+                          <PolarGrid stroke="#1f2a44" />
+                          <PolarAngleAxis dataKey="metric" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                          <Radar dataKey="value" stroke="#a78bfa" fill="#a78bfa" fillOpacity={0.3} />
+                          <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1f2a44" }} />
+                        </RadarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+                </section>
+              </>
+            )}
           </>
         )}
 
