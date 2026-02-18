@@ -83,6 +83,23 @@ type SessionConversationMetrics = {
   rapport_building_phrases: number;
 };
 
+type SessionAudioMetrics = {
+  speaking_duration_ms: number;
+  silence_duration_ms: number;
+  avg_pause_ms: number;
+  speaking_rate_wpm: number;
+  pace_label: string;
+  hesitation_count: number;
+  hesitation_rate: number;
+  avg_stt_confidence: number | null;
+  avg_response_latency_ms: number | null;
+  interruption_count: number;
+  confidence_score: number;
+  vocal_clarity_score: number;
+  energy_score: number;
+  segment_count: number;
+};
+
 type AgentMessage =
   | { type: typeof MESSAGE_TYPES.AGENT_CONNECTED; message: string }
   | { type: typeof MESSAGE_TYPES.DIFFICULTY_ASSIGNED; level?: string; averages?: Record<string, number | null>; autoEnabled?: boolean }
@@ -100,7 +117,7 @@ type AgentMessage =
   | { type: typeof MESSAGE_TYPES.STT_FINAL; text: string }
   | { type: typeof MESSAGE_TYPES.AGENT_TEXT; text: string }
   | { type: typeof MESSAGE_TYPES.COACH_HINT; text: string }
-  | { type: typeof MESSAGE_TYPES.CALL_FEEDBACK; payload: FeedbackPayload; conversationMetrics?: SessionConversationMetrics | null; callDurationMs: number; turnCount: number }
+  | { type: typeof MESSAGE_TYPES.CALL_FEEDBACK; payload: FeedbackPayload; conversationMetrics?: SessionConversationMetrics | null; audioMetrics?: SessionAudioMetrics | null; callDurationMs: number; turnCount: number }
   | { type: string; [key: string]: unknown };
 
 function safeParse(raw: string): AgentMessage | null {
@@ -165,6 +182,7 @@ export default function HomePage() {
   const [feedback, setFeedback] = useState<FeedbackPayload | null>(null);
   const [callMetrics, setCallMetrics] = useState<{ duration: number; turns: number } | null>(null);
   const [sessionMetrics, setSessionMetrics] = useState<SessionConversationMetrics | null>(null);
+  const [sessionAudioMetrics, setSessionAudioMetrics] = useState<SessionAudioMetrics | null>(null);
   const [latestSessionId, setLatestSessionId] = useState<string | number | null>(null);
   const [scenarioId, setScenarioId] = useState<string>(SCENARIOS[0]?.id || "");
   const [scenarioLocked, setScenarioLocked] = useState<boolean>(false);
@@ -596,10 +614,23 @@ export default function HomePage() {
         }
         case MESSAGE_TYPES.STT_FINAL: {
           // Finalize the user transcript.
+          // Append to the existing "you" bubble if the user is still speaking
+          // (i.e. the last message is already from "you"), so a single
+          // continuous utterance doesn't split into many boxes.
           if (typeof parsed.text === "string") {
-            const text = parsed.text; // Narrow type for reuse without unknown complaints.
+            const text = parsed.text;
             setPartialTranscript("");
-            setConversation((prev) => [...prev, { speaker: "you", text }]);
+            setConversation((prev) => {
+              if (prev.length > 0 && prev[prev.length - 1].speaker === "you") {
+                const updated = [...prev];
+                updated[updated.length - 1] = {
+                  ...updated[updated.length - 1],
+                  text: `${updated[updated.length - 1].text} ${text}`,
+                };
+                return updated;
+              }
+              return [...prev, { speaker: "you", text }];
+            });
             console.log("Final transcript:", text);
           }
           break;
@@ -626,6 +657,9 @@ export default function HomePage() {
             });
             if (parsed.conversationMetrics && typeof parsed.conversationMetrics === "object") {
               setSessionMetrics(parsed.conversationMetrics as SessionConversationMetrics);
+            }
+            if (parsed.audioMetrics && typeof parsed.audioMetrics === "object") {
+              setSessionAudioMetrics(parsed.audioMetrics as SessionAudioMetrics);
             }
             setCallEnded(true);
             clearCoachHint();
@@ -993,6 +1027,7 @@ export default function HomePage() {
     setFeedback(null);
     setCallMetrics(null);
     setSessionMetrics(null);
+    setSessionAudioMetrics(null);
     setConversation([]);
     setPartialTranscript("");
     setAgentSpeaking(false);
@@ -1153,6 +1188,45 @@ export default function HomePage() {
                   <span style={{ padding: "0.3rem 0.65rem", borderRadius: "999px", background: "rgba(167,139,250,0.2)", fontSize: "0.75rem", border: "1px solid rgba(167,139,250,0.3)" }}>Rapport: {sessionMetrics.rapport_building_phrases} phrases</span>
                 )}
               </div>
+            </div>
+          )}
+
+          {/* Voice Intelligence Metrics */}
+          {sessionAudioMetrics && (
+            <div style={{ marginBottom: "1.5rem" }}>
+              <h3 style={{ margin: "0 0 0.75rem", fontSize: "1.2rem", color: "#22d3ee" }}>Voice Intelligence</h3>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: "0.75rem", marginBottom: "1rem" }}>
+                <div style={{ padding: "0.75rem", background: "rgba(34,211,238,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Confidence</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionAudioMetrics.confidence_score}/10</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(34,211,238,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Vocal Clarity</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionAudioMetrics.vocal_clarity_score}/10</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(34,211,238,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Energy</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionAudioMetrics.energy_score}/10</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(34,211,238,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Speaking Rate</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionAudioMetrics.speaking_rate_wpm} wpm</p>
+                  <p style={{ margin: 0, fontSize: "0.65rem", opacity: 0.5 }}>{sessionAudioMetrics.pace_label}</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(34,211,238,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Hesitations</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{sessionAudioMetrics.hesitation_count}</p>
+                  <p style={{ margin: 0, fontSize: "0.65rem", opacity: 0.5 }}>{sessionAudioMetrics.hesitation_rate}% of words</p>
+                </div>
+                <div style={{ padding: "0.75rem", background: "rgba(34,211,238,0.1)", borderRadius: "10px" }}>
+                  <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6 }}>Silence</p>
+                  <p style={{ margin: "0.3rem 0 0", fontSize: "1.3rem", fontWeight: 700 }}>{(sessionAudioMetrics.silence_duration_ms / 1000).toFixed(1)}s</p>
+                  <p style={{ margin: 0, fontSize: "0.65rem", opacity: 0.5 }}>avg pause {(sessionAudioMetrics.avg_pause_ms / 1000).toFixed(1)}s</p>
+                </div>
+              </div>
+              {sessionAudioMetrics.avg_stt_confidence != null && (
+                <p style={{ margin: "0.25rem 0", fontSize: "0.8rem", opacity: 0.6 }}>STT Confidence: {(sessionAudioMetrics.avg_stt_confidence * 100).toFixed(0)}%</p>
+              )}
             </div>
           )}
 

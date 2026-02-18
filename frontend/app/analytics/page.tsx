@@ -62,11 +62,25 @@ type ConversationMetrics = {
   total_sessions: number;
 };
 
+type VoiceMetrics = {
+  avg_speaking_rate_wpm: number;
+  avg_silence_duration_ms: number;
+  avg_pause_ms: number;
+  avg_hesitation_count: number;
+  avg_hesitation_rate: number;
+  avg_stt_confidence: number | null;
+  avg_confidence_score: number;
+  avg_vocal_clarity_score: number;
+  avg_energy_score: number;
+  total_sessions: number;
+};
+
 type AnalyticsResponse = {
   summary: AnalyticsSummary;
   trend: AnalyticsTrendPoint[];
   byScenario: AnalyticsScenario[];
   conversationMetrics?: ConversationMetrics | null;
+  voiceMetrics?: VoiceMetrics | null;
 };
 
 type TeamMember = {
@@ -865,6 +879,77 @@ export default function AnalyticsPage() {
                   </div>
                 </section>
               </>
+            )}
+
+            {/* Voice Intelligence Metrics */}
+            {data?.voiceMetrics && (
+              <section>
+                <h2 style={{ margin: "0 0 1rem", fontSize: "1.3rem", fontWeight: 700, color: "#22d3ee" }}>Voice Intelligence</h2>
+                <div
+                  style={{
+                    display: "grid",
+                    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+                    gap: "1rem",
+                    marginBottom: "1.5rem",
+                  }}
+                >
+                  {[
+                    { label: "Confidence", value: `${data.voiceMetrics.avg_confidence_score}/10`, sub: "Proxy from audio" },
+                    { label: "Vocal Clarity", value: `${data.voiceMetrics.avg_vocal_clarity_score}/10`, sub: "Speech recognition quality" },
+                    { label: "Energy", value: `${data.voiceMetrics.avg_energy_score}/10`, sub: "Speaking engagement" },
+                    { label: "Speaking Rate", value: `${data.voiceMetrics.avg_speaking_rate_wpm} wpm`, sub: "Words per minute" },
+                    { label: "Hesitations", value: `${data.voiceMetrics.avg_hesitation_count}`, sub: `${data.voiceMetrics.avg_hesitation_rate}% of words` },
+                    { label: "Avg Pause", value: `${(data.voiceMetrics.avg_pause_ms / 1000).toFixed(1)}s`, sub: "Between segments" },
+                    { label: "Silence", value: `${(data.voiceMetrics.avg_silence_duration_ms / 1000).toFixed(1)}s`, sub: "Total per session" },
+                    ...(data.voiceMetrics.avg_stt_confidence != null ? [{ label: "STT Confidence", value: `${(data.voiceMetrics.avg_stt_confidence * 100).toFixed(0)}%`, sub: "Deepgram recognition" }] : []),
+                  ].map((item) => (
+                    <div
+                      key={item.label}
+                      style={{
+                        padding: "1.1rem",
+                        borderRadius: "14px",
+                        background: "rgba(15, 23, 42, 0.85)",
+                        border: "1px solid rgba(34, 211, 238, 0.2)",
+                      }}
+                    >
+                      <p style={{ margin: 0, fontSize: "0.75rem", opacity: 0.6, textTransform: "uppercase", letterSpacing: "0.1em" }}>{item.label}</p>
+                      <p style={{ margin: "0.4rem 0 0", fontSize: "1.5rem", fontWeight: 700, color: "#22d3ee" }}>{item.value}</p>
+                      <p style={{ margin: "0.2rem 0 0", fontSize: "0.7rem", opacity: 0.5 }}>{item.sub}</p>
+                    </div>
+                  ))}
+                </div>
+
+                {/* Voice Quality Radar */}
+                <div
+                  style={{
+                    padding: "1.5rem",
+                    borderRadius: "18px",
+                    background: "rgba(15, 23, 42, 0.85)",
+                    border: "1px solid rgba(34, 211, 238, 0.15)",
+                  }}
+                >
+                  <h2 style={{ margin: "0 0 1rem", fontSize: "1.2rem" }}>Voice Quality Profile</h2>
+                  <div style={{ width: "100%", height: "280px" }}>
+                    <ResponsiveContainer>
+                      <RadarChart
+                        data={[
+                          { metric: "Confidence", value: data.voiceMetrics.avg_confidence_score },
+                          { metric: "Clarity", value: data.voiceMetrics.avg_vocal_clarity_score },
+                          { metric: "Energy", value: data.voiceMetrics.avg_energy_score },
+                          { metric: "Fluency", value: Math.max(0, 10 - data.voiceMetrics.avg_hesitation_rate * 2) },
+                          { metric: "Pacing", value: Math.min(10, data.voiceMetrics.avg_speaking_rate_wpm >= 120 && data.voiceMetrics.avg_speaking_rate_wpm <= 160 ? 10 : Math.max(0, 10 - Math.abs(data.voiceMetrics.avg_speaking_rate_wpm - 140) / 10)) },
+                        ]}
+                        outerRadius={90}
+                      >
+                        <PolarGrid stroke="#1f2a44" />
+                        <PolarAngleAxis dataKey="metric" stroke="#94a3b8" tick={{ fontSize: 12 }} />
+                        <Radar dataKey="value" stroke="#22d3ee" fill="#22d3ee" fillOpacity={0.3} />
+                        <Tooltip contentStyle={{ background: "#0f172a", border: "1px solid #1f2a44" }} />
+                      </RadarChart>
+                    </ResponsiveContainer>
+                  </div>
+                </div>
+              </section>
             )}
           </>
         )}
