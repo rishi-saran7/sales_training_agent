@@ -187,7 +187,12 @@ export default function AnalyticsPage() {
       } catch (err) {
         console.error("Failed to load analytics", err);
         if (active) {
-          setError("Failed to load analytics");
+          const isNetworkError = err instanceof TypeError && err.message.includes("fetch");
+          setError(
+            isNetworkError
+              ? "Cannot reach the server. Please check that the backend is running and try again."
+              : "Failed to load analytics"
+          );
         }
       } finally {
         if (active) {
@@ -657,9 +662,29 @@ export default function AnalyticsPage() {
               borderRadius: "16px",
               background: "rgba(239, 68, 68, 0.15)",
               border: "1px solid rgba(239, 68, 68, 0.3)",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "1rem",
             }}
           >
-            {error}
+            <span>{error}</span>
+            <button
+              onClick={() => window.location.reload()}
+              style={{
+                padding: "6px 18px",
+                borderRadius: "8px",
+                border: "1px solid rgba(239, 68, 68, 0.5)",
+                background: "rgba(239, 68, 68, 0.25)",
+                color: "#fca5a5",
+                cursor: "pointer",
+                fontWeight: 600,
+                fontSize: "0.85rem",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Retry
+            </button>
           </div>
         )}
 

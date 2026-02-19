@@ -211,6 +211,14 @@ export default function HomePage() {
   const [complaintError, setComplaintError] = useState("");
   const [autoDifficultyEnabled, setAutoDifficultyEnabled] = useState<boolean>(true);
 
+  // ── Error / reconnection banner state ──────────────────────────────────────
+  const [errorBanner, setErrorBanner] = useState<string>("");
+  const [successBanner, setSuccessBanner] = useState<string>("");
+  const reconnectAttemptRef = useRef<number>(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const MAX_RECONNECT_ATTEMPTS = 8;
+  const BASE_RECONNECT_DELAY_MS = 1000; // exponential back-off base
+
   const recordingRef = useRef<RecordingHandles | null>(null);
   const socketRef = useRef<WebSocket | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
@@ -468,28 +476,40 @@ export default function HomePage() {
   }, [authLoading, authToken]);
 
   useEffect(() => {
-    // Establish the live WebSocket link to the backend agent gateway.
-    const socket = new WebSocket(WS_URL);
-    socketRef.current = socket;
+    let unmounted = false;
 
-    socket.onopen = () => {
-      setStatus("connected");
-      if (authTokenRef.current) {
-        sendAuthToken(authTokenRef.current);
-      }
-      sendDifficultyMode(autoDifficultyEnabledRef.current);
-    };
+    function connectWebSocket() {
+      if (unmounted) return;
+      const socket = new WebSocket(WS_URL);
+      socketRef.current = socket;
+      setStatus("connecting");
 
-    socket.onclose = () => {
-      setStatus("disconnected");
-    };
+      socket.onopen = () => {
+        if (unmounted) { socket.close(); return; }
+        setStatus("connected");
+        setErrorBanner("");
+        setSuccessBanner("Connected to server");
+        setTimeout(() => setSuccessBanner(""), 2000);
+        reconnectAttemptRef.current = 0;
+        if (authTokenRef.current) {
+          sendAuthToken(authTokenRef.current);
+        }
+        sendDifficultyMode(autoDifficultyEnabledRef.current);
+      };
 
-    socket.onerror = (event) => {
-      console.error("WebSocket encountered an error", event);
-      setStatus("disconnected");
-    };
+      socket.onclose = () => {
+        if (unmounted) return;
+        setStatus("disconnected");
+        scheduleReconnect();
+      };
 
-    socket.onmessage = (event) => {
+      socket.onerror = () => {
+        if (unmounted) return;
+        setStatus("disconnected");
+        // onclose will fire after onerror — reconnect scheduled there.
+      };
+
+      socket.onmessage = (event) => {
       const parsed: AgentMessage | null = safeParse(event.data);
       if (!parsed) {
         console.warn("Ignoring malformed message from agent");
@@ -674,11 +694,31 @@ export default function HomePage() {
         }
       }
     };
+    } // end connectWebSocket
+
+    function scheduleReconnect() {
+      if (unmounted) return;
+      const attempt = reconnectAttemptRef.current;
+      if (attempt >= MAX_RECONNECT_ATTEMPTS) {
+        setErrorBanner("Connection lost. Please refresh the page.");
+        return;
+      }
+      const delay = Math.min(BASE_RECONNECT_DELAY_MS * 2 ** attempt, 30000);
+      reconnectAttemptRef.current = attempt + 1;
+      setErrorBanner(`Connection lost — reconnecting in ${Math.round(delay / 1000)}s (attempt ${attempt + 1}/${MAX_RECONNECT_ATTEMPTS})...`);
+      reconnectTimerRef.current = setTimeout(() => {
+        if (!unmounted) connectWebSocket();
+      }, delay);
+    }
+
+    connectWebSocket();
 
     return () => {
+      unmounted = true;
+      if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
       // Ensure we stop any active recording when the component unmounts.
       stopRecording();
-      socket.close();
+      socketRef.current?.close();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -846,7 +886,7 @@ export default function HomePage() {
     const { allowImmediateInterrupt = true } = options;
     if (micStatus === "recording") return;
     if (!socketRef.current || socketRef.current.readyState !== WebSocket.OPEN) {
-      console.warn("Socket not ready; cannot start recording");
+      setErrorBanner("Not connected to the server. Reconnecting...");
       return;
     }
 
@@ -961,6 +1001,7 @@ export default function HomePage() {
     } catch (error) {
       console.error("Unable to start microphone capture", error);
       setMicStatus("error");
+      setErrorBanner("Microphone access failed. Please check your browser permissions and try again.");
     }
   }
 
@@ -1079,8 +1120,71 @@ export default function HomePage() {
         background: "linear-gradient(135deg, #0c1b33, #0f2740)",
         color: "#e8eef5",
         fontFamily: "'IBM Plex Sans', system-ui, -apple-system, sans-serif",
+        flexDirection: "column",
       }}
     >
+      {/* ── Success Banner ── */}
+      {successBanner && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 10000,
+            background: "linear-gradient(90deg, #22c55e, #16a34a)",
+            color: "#fff",
+            padding: "10px 20px",
+            textAlign: "center",
+            fontSize: "0.9rem",
+            fontWeight: 600,
+            letterSpacing: "0.02em",
+            boxShadow: "0 2px 12px rgba(0,0,0,0.2)",
+          }}
+        >
+          {successBanner}
+        </div>
+      )}
+      {/* ── Error / Reconnection Banner ── */}
+      {errorBanner && (
+        <div
+          style={{
+            position: "fixed",
+            top: 0,
+            left: 0,
+            right: 0,
+            zIndex: 9999,
+            background: "linear-gradient(90deg, #b91c1c, #dc2626)",
+            color: "#fff",
+            padding: "10px 20px",
+            textAlign: "center",
+            fontSize: "0.9rem",
+            fontWeight: 600,
+            letterSpacing: "0.02em",
+            boxShadow: "0 2px 12px rgba(0,0,0,0.4)",
+          }}
+        >
+          {errorBanner}
+          {reconnectAttemptRef.current >= MAX_RECONNECT_ATTEMPTS && (
+            <button
+              onClick={() => { reconnectAttemptRef.current = 0; setErrorBanner(""); window.location.reload(); }}
+              style={{
+                marginLeft: "16px",
+                padding: "4px 14px",
+                borderRadius: "6px",
+                border: "1px solid rgba(255,255,255,0.5)",
+                background: "transparent",
+                color: "#fff",
+                cursor: "pointer",
+                fontWeight: 600,
+                fontSize: "0.85rem",
+              }}
+            >
+              Reload
+            </button>
+          )}
+        </div>
+      )}
       {callEnded && feedback ? (
         // Feedback Screen
         <div

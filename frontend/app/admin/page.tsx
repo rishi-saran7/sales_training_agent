@@ -104,7 +104,12 @@ export default function AdminPage() {
         setOrgs(Array.isArray(orgPayload?.organizations) ? orgPayload.organizations : []);
       } catch (err) {
         console.error("Failed to load admin data", err);
-        if (active) setError("Failed to load admin data");
+        const isNetworkError = err instanceof TypeError && String(err.message).includes("fetch");
+        if (active) setError(
+          isNetworkError
+            ? "Cannot reach the server. Please check that the backend is running and try again."
+            : "Failed to load admin data"
+        );
       } finally {
         if (active) setLoading(false);
       }
@@ -476,9 +481,29 @@ export default function AdminPage() {
               background: "rgba(248, 113, 113, 0.12)",
               border: "1px solid rgba(248, 113, 113, 0.4)",
               color: "#fecaca",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "space-between",
+              gap: "1rem",
             }}
           >
-            {error}
+            <span>{error}</span>
+            <button
+              onClick={() => window.location.reload()}
+              style={{
+                padding: "6px 18px",
+                borderRadius: "8px",
+                border: "1px solid rgba(248, 113, 113, 0.5)",
+                background: "rgba(248, 113, 113, 0.25)",
+                color: "#fecaca",
+                cursor: "pointer",
+                fontWeight: 600,
+                fontSize: "0.85rem",
+                whiteSpace: "nowrap",
+              }}
+            >
+              Retry
+            </button>
           </div>
         )}
 
