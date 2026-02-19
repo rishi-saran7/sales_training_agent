@@ -9,6 +9,16 @@ const { supabase } = require('./lib/supabase');
 const { aggregateMetrics } = require('./metricsEngine');
 const { aggregateVoiceMetrics } = require('./voiceMetrics');
 
+// ── Observability modules ────────────────────────────────────────────────────
+const log = require('./lib/logger');
+const perf = require('./lib/perfTracker');
+const usage = require('./lib/usageTracker');
+const { apiLimiter, authLimiter, heavyLimiter } = require('./lib/rateLimiter');
+const errorMonitor = require('./lib/errorMonitor');
+
+// Install global error handlers (uncaughtException, unhandledRejection).
+errorMonitor.installGlobalHandlers();
+
 // Use a fixed port so the frontend knows where to connect during local development.
 const PORT = process.env.PORT ? Number(process.env.PORT) : 3001;
 
@@ -18,6 +28,23 @@ app.use(express.json());
 
 // Allow the Next.js dev server to reach this API. Adjust origins when deploying.
 app.use(cors({ origin: 'http://localhost:3000' }));
+
+// ── Rate limiting ────────────────────────────────────────────────────────────
+app.use('/api/auth', authLimiter);
+app.use('/api/analytics', heavyLimiter);
+app.use('/api/report', heavyLimiter);
+app.use('/api', apiLimiter);
+
+// ── Health check ─────────────────────────────────────────────────────────────
+app.get('/api/health', (_req, res) => {
+  res.json({
+    status: 'ok',
+    uptime: process.uptime(),
+    timestamp: new Date().toISOString(),
+    usage: usage.getGlobalStats(),
+    perf: perf.getSummary(),
+  });
+});
 
 async function requireUser(req, res) {
   if (!supabase) {
@@ -147,7 +174,7 @@ async function requireTrainer(userId, res) {
     res.status(403).json({ error: 'Trainer role required' });
     return null;
   }
-  console.log(`[org] Role detected: ${membership.role}`);
+  log.info(`[org] Role detected: ${membership.role}`);
   return membership;
 }
 
@@ -554,7 +581,7 @@ app.post('/api/org/bootstrap', async (req, res) => {
       .single();
 
     if (orgError || !org) {
-      console.error('[org] Failed to create organization:', orgError?.message || orgError);
+      log.error('[org] Failed to create organization:' + orgError?.message || orgError);
       res.status(500).json({ error: 'Failed to create organization' });
       return;
     }
@@ -564,15 +591,15 @@ app.post('/api/org/bootstrap', async (req, res) => {
       .insert({ organization_id: org.id, user_id: user.id, role: 'trainer' });
 
     if (memberError) {
-      console.error('[org] Failed to add trainer membership:', memberError.message || memberError);
+      log.error('[org] Failed to add trainer membership:' + memberError.message || memberError);
       res.status(500).json({ error: 'Failed to add organization member' });
       return;
     }
 
-    console.log(`[org] Org created (${org.name}) and trainer assigned`);
+    log.info(`[org] Org created (${org.name}) and trainer assigned`);
     res.json({ organizationId: org.id, organizationName: org.name, role: 'trainer' });
   } catch (err) {
-    console.error('[org] Bootstrap failed:', err.message || err);
+    log.error('[org] Bootstrap failed:' + err.message || err);
     res.status(500).json({ error: 'Failed to bootstrap organization' });
   }
 });
@@ -610,7 +637,7 @@ app.post('/api/admin/trainers', async (req, res) => {
           email_confirm: true,
         });
         if (createError || !created?.user) {
-          console.error('[admin] Failed to create user:', createError?.message || createError);
+          log.error('[admin] Failed to create user:' + createError?.message || createError);
           res.status(500).json({ error: 'Failed to create trainer user' });
           return;
         }
@@ -618,7 +645,7 @@ app.post('/api/admin/trainers', async (req, res) => {
       } else {
         const { data: invited, error: inviteError } = await supabase.auth.admin.inviteUserByEmail(targetEmail);
         if (inviteError || !invited?.user) {
-          console.error('[admin] Failed to invite user:', inviteError?.message || inviteError);
+          log.error('[admin] Failed to invite user:' + inviteError?.message || inviteError);
           res.status(500).json({ error: 'Failed to invite trainer user' });
           return;
         }
@@ -646,7 +673,7 @@ app.post('/api/admin/trainers', async (req, res) => {
         .maybeSingle();
 
       if (orgFetchError || !existingOrg) {
-        console.error('[admin] Failed to load organization:', orgFetchError?.message || orgFetchError);
+        log.error('[admin] Failed to load organization:' + orgFetchError?.message || orgFetchError);
         res.status(404).json({ error: 'Organization not found' });
         return;
       }
@@ -662,7 +689,7 @@ app.post('/api/admin/trainers', async (req, res) => {
         .single();
 
       if (orgError || !createdOrg) {
-        console.error('[admin] Failed to create organization:', orgError?.message || orgError);
+        log.error('[admin] Failed to create organization:' + orgError?.message || orgError);
         res.status(500).json({ error: 'Failed to create organization' });
         return;
       }
@@ -674,15 +701,15 @@ app.post('/api/admin/trainers', async (req, res) => {
       .insert({ organization_id: org.id, user_id: targetUser.id, role: 'trainer' });
 
     if (memberError) {
-      console.error('[admin] Failed to add trainer:', memberError.message || memberError);
+      log.error('[admin] Failed to add trainer:' + memberError.message || memberError);
       res.status(500).json({ error: 'Failed to add trainer' });
       return;
     }
 
-    console.log(`[admin] Trainer created: ${targetUser.email}`);
+    log.info(`[admin] Trainer created: ${targetUser.email}`);
     res.json({ success: true, user_id: targetUser.id, email: targetUser.email, organizationId: org.id });
   } catch (err) {
-    console.error('[admin] Failed to create trainer:', err.message || err);
+    log.error('[admin] Failed to create trainer:' + err.message || err);
     res.status(500).json({ error: 'Failed to create trainer' });
   }
 });
@@ -697,14 +724,14 @@ app.get('/api/org/me', async (req, res) => {
       res.json({ role: null, organizationId: null, organizationName: null });
       return;
     }
-    console.log(`[org] Role detected: ${membership.role}`);
+    log.info(`[org] Role detected: ${membership.role}`);
     res.json({
       role: membership.role,
       organizationId: membership.organization_id,
       organizationName: membership.organizations?.name || 'Organization',
     });
   } catch (err) {
-    console.error('[org] Failed to load membership:', err.message || err);
+    log.error('[org] Failed to load membership:' + err.message || err);
     res.status(500).json({ error: 'Failed to load organization membership' });
   }
 });
@@ -726,7 +753,7 @@ app.get('/api/org/trainer', async (req, res) => {
       organizationName: membership.organizations?.name || 'Organization',
     });
   } catch (err) {
-    console.error('[org] Failed to load trainer email:', err.message || err);
+    log.error('[org] Failed to load trainer email:' + err.message || err);
     res.status(500).json({ error: 'Failed to load trainer email' });
   }
 });
@@ -745,7 +772,7 @@ app.get('/api/org/unassigned', async (req, res) => {
       .select('user_id');
 
     if (error) {
-      console.error('[org] Failed to fetch members:', error.message || error);
+      log.error('[org] Failed to fetch members:' + error.message || error);
       res.status(500).json({ error: 'Failed to fetch members' });
       return;
     }
@@ -761,7 +788,7 @@ app.get('/api/org/unassigned', async (req, res) => {
 
     res.json({ users: unassigned });
   } catch (err) {
-    console.error('[org] Failed to load unassigned users:', err.message || err);
+    log.error('[org] Failed to load unassigned users:' + err.message || err);
     res.status(500).json({ error: 'Failed to load unassigned users' });
   }
 });
@@ -807,15 +834,15 @@ app.post('/api/org/assign', async (req, res) => {
       });
 
     if (insertError) {
-      console.error('[org] Failed to add trainee:', insertError.message || insertError);
+      log.error('[org] Failed to add trainee:' + insertError.message || insertError);
       res.status(500).json({ error: 'Failed to assign trainee' });
       return;
     }
 
-    console.log(`[org] Member added: ${targetUser.email}`);
+    log.info(`[org] Member added: ${targetUser.email}`);
     res.json({ success: true, user_id: targetUser.id, email: targetUser.email });
   } catch (err) {
-    console.error('[org] Failed to assign trainee:', err.message || err);
+    log.error('[org] Failed to assign trainee:' + err.message || err);
     res.status(500).json({ error: 'Failed to assign trainee' });
   }
 });
@@ -846,7 +873,7 @@ app.get('/api/org/team', async (req, res) => {
       .in('user_id', traineeIds);
 
     if (sessionError) {
-      console.error('[org] Failed to fetch team sessions:', sessionError.message || sessionError);
+      log.error('[org] Failed to fetch team sessions:' + sessionError.message || sessionError);
       res.status(500).json({ error: 'Failed to fetch team sessions' });
       return;
     }
@@ -897,7 +924,7 @@ app.get('/api/org/team', async (req, res) => {
 
     res.json({ members: membersPayload });
   } catch (err) {
-    console.error('[org] Failed to fetch team data:', err.message || err);
+    log.error('[org] Failed to fetch team data:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch team data' });
   }
 });
@@ -944,7 +971,7 @@ app.get('/api/org/trainees/:userId/analytics', async (req, res) => {
       range: analytics.range,
     });
   } catch (err) {
-    console.error('[org] Failed to fetch trainee analytics:', err.message || err);
+    log.error('[org] Failed to fetch trainee analytics:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch trainee analytics' });
   }
 });
@@ -984,14 +1011,14 @@ app.get('/api/org/trainees/:userId/sessions', async (req, res) => {
       .limit(50);
 
     if (error) {
-      console.error('[org] Failed to fetch trainee sessions:', error.message || error);
+      log.error('[org] Failed to fetch trainee sessions:' + error.message || error);
       res.status(500).json({ error: 'Failed to fetch trainee sessions' });
       return;
     }
 
     res.json({ sessions: data || [] });
   } catch (err) {
-    console.error('[org] Failed to fetch trainee sessions:', err.message || err);
+    log.error('[org] Failed to fetch trainee sessions:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch trainee sessions' });
   }
 });
@@ -1005,7 +1032,7 @@ app.get('/api/admin/me', async (req, res) => {
     if (!admin) return;
     res.json({ isAdmin: true, userId: user.id });
   } catch (err) {
-    console.error('[admin] Failed to check admin:', err.message || err);
+    log.error('[admin] Failed to check admin:' + err.message || err);
     res.status(500).json({ error: 'Failed to verify admin' });
   }
 });
@@ -1024,7 +1051,7 @@ app.get('/api/admin/trainers', async (req, res) => {
       .eq('role', 'trainer');
 
     if (error) {
-      console.error('[admin] Failed to fetch trainers:', error.message || error);
+      log.error('[admin] Failed to fetch trainers:' + error.message || error);
       res.status(500).json({ error: 'Failed to fetch trainers' });
       return;
     }
@@ -1042,7 +1069,7 @@ app.get('/api/admin/trainers', async (req, res) => {
 
     res.json({ trainers: payload });
   } catch (err) {
-    console.error('[admin] Failed to load trainers:', err.message || err);
+    log.error('[admin] Failed to load trainers:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch trainers' });
   }
 });
@@ -1071,14 +1098,14 @@ app.patch('/api/admin/trainers/:userId', async (req, res) => {
       .maybeSingle();
 
     if (error || !data) {
-      console.error('[admin] Failed to update trainer:', error?.message || error);
+      log.error('[admin] Failed to update trainer:' + error?.message || error);
       res.status(500).json({ error: 'Failed to update trainer' });
       return;
     }
 
     res.json({ success: true, trainer: data });
   } catch (err) {
-    console.error('[admin] Failed to update trainer:', err.message || err);
+    log.error('[admin] Failed to update trainer:' + err.message || err);
     res.status(500).json({ error: 'Failed to update trainer' });
   }
 });
@@ -1104,14 +1131,14 @@ app.delete('/api/admin/trainers/:userId', async (req, res) => {
       .eq('role', 'trainer');
 
     if (error) {
-      console.error('[admin] Failed to remove trainer:', error.message || error);
+      log.error('[admin] Failed to remove trainer:' + error.message || error);
       res.status(500).json({ error: 'Failed to remove trainer' });
       return;
     }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('[admin] Failed to remove trainer:', err.message || err);
+    log.error('[admin] Failed to remove trainer:' + err.message || err);
     res.status(500).json({ error: 'Failed to remove trainer' });
   }
 });
@@ -1130,14 +1157,14 @@ app.get('/api/admin/orgs', async (req, res) => {
       .order('created_at', { ascending: false });
 
     if (error) {
-      console.error('[admin] Failed to load organizations:', error.message || error);
+      log.error('[admin] Failed to load organizations:' + error.message || error);
       res.status(500).json({ error: 'Failed to load organizations' });
       return;
     }
 
     res.json({ organizations: data || [] });
   } catch (err) {
-    console.error('[admin] Failed to load organizations:', err.message || err);
+    log.error('[admin] Failed to load organizations:' + err.message || err);
     res.status(500).json({ error: 'Failed to load organizations' });
   }
 });
@@ -1163,14 +1190,14 @@ app.post('/api/admin/orgs', async (req, res) => {
       .single();
 
     if (error || !data) {
-      console.error('[admin] Failed to create organization:', error?.message || error);
+      log.error('[admin] Failed to create organization:' + error?.message || error);
       res.status(500).json({ error: 'Failed to create organization' });
       return;
     }
 
     res.json({ organization: data });
   } catch (err) {
-    console.error('[admin] Failed to create organization:', err.message || err);
+    log.error('[admin] Failed to create organization:' + err.message || err);
     res.status(500).json({ error: 'Failed to create organization' });
   }
 });
@@ -1198,14 +1225,14 @@ app.patch('/api/admin/orgs/:orgId', async (req, res) => {
       .single();
 
     if (error || !data) {
-      console.error('[admin] Failed to update organization:', error?.message || error);
+      log.error('[admin] Failed to update organization:' + error?.message || error);
       res.status(500).json({ error: 'Failed to update organization' });
       return;
     }
 
     res.json({ organization: data });
   } catch (err) {
-    console.error('[admin] Failed to update organization:', err.message || err);
+    log.error('[admin] Failed to update organization:' + err.message || err);
     res.status(500).json({ error: 'Failed to update organization' });
   }
 });
@@ -1230,7 +1257,7 @@ app.delete('/api/admin/orgs/:orgId', async (req, res) => {
       .eq('organization_id', orgId);
 
     if (memberError) {
-      console.error('[admin] Failed to remove org members:', memberError.message || memberError);
+      log.error('[admin] Failed to remove org members:' + memberError.message || memberError);
       res.status(500).json({ error: 'Failed to remove org members' });
       return;
     }
@@ -1241,14 +1268,14 @@ app.delete('/api/admin/orgs/:orgId', async (req, res) => {
       .eq('id', orgId);
 
     if (orgError) {
-      console.error('[admin] Failed to delete organization:', orgError.message || orgError);
+      log.error('[admin] Failed to delete organization:' + orgError.message || orgError);
       res.status(500).json({ error: 'Failed to delete organization' });
       return;
     }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('[admin] Failed to delete organization:', err.message || err);
+    log.error('[admin] Failed to delete organization:' + err.message || err);
     res.status(500).json({ error: 'Failed to delete organization' });
   }
 });
@@ -1276,14 +1303,14 @@ app.patch('/api/admin/users/:userId', async (req, res) => {
 
     const { data, error } = await supabase.auth.admin.updateUserById(targetUserId, payload);
     if (error) {
-      console.error('[admin] Failed to update user:', error.message || error);
+      log.error('[admin] Failed to update user:' + error.message || error);
       res.status(500).json({ error: 'Failed to update user' });
       return;
     }
 
     res.json({ success: true, user: data?.user || null });
   } catch (err) {
-    console.error('[admin] Failed to update user:', err.message || err);
+    log.error('[admin] Failed to update user:' + err.message || err);
     res.status(500).json({ error: 'Failed to update user' });
   }
 });
@@ -1307,14 +1334,14 @@ app.post('/api/admin/users/:userId/disable', async (req, res) => {
     });
 
     if (error) {
-      console.error('[admin] Failed to disable user:', error.message || error);
+      log.error('[admin] Failed to disable user:' + error.message || error);
       res.status(500).json({ error: 'Failed to disable user' });
       return;
     }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('[admin] Failed to disable user:', err.message || err);
+    log.error('[admin] Failed to disable user:' + err.message || err);
     res.status(500).json({ error: 'Failed to disable user' });
   }
 });
@@ -1338,14 +1365,14 @@ app.post('/api/admin/users/:userId/enable', async (req, res) => {
     });
 
     if (error) {
-      console.error('[admin] Failed to enable user:', error.message || error);
+      log.error('[admin] Failed to enable user:' + error.message || error);
       res.status(500).json({ error: 'Failed to enable user' });
       return;
     }
 
     res.json({ success: true });
   } catch (err) {
-    console.error('[admin] Failed to enable user:', err.message || err);
+    log.error('[admin] Failed to enable user:' + err.message || err);
     res.status(500).json({ error: 'Failed to enable user' });
   }
 });
@@ -1450,7 +1477,7 @@ app.get('/api/conversations', async (req, res) => {
 
     res.json({ conversations: enriched });
   } catch (err) {
-    console.error('[messages] Failed to list conversations:', err.message || err);
+    log.error('[messages] Failed to list conversations:' + err.message || err);
     res.status(500).json({ error: 'Failed to list conversations' });
   }
 });
@@ -1514,7 +1541,7 @@ app.post('/api/conversations', async (req, res) => {
     if (error) throw error;
     res.json({ conversation: newConv, created: true });
   } catch (err) {
-    console.error('[messages] Failed to create conversation:', err.message || err);
+    log.error('[messages] Failed to create conversation:' + err.message || err);
     res.status(500).json({ error: 'Failed to create conversation' });
   }
 });
@@ -1600,7 +1627,7 @@ app.get('/api/conversations/:id/messages', async (req, res) => {
 
     res.json({ messages: enriched });
   } catch (err) {
-    console.error('[messages] Failed to fetch messages:', err.message || err);
+    log.error('[messages] Failed to fetch messages:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch messages' });
   }
 });
@@ -1653,7 +1680,7 @@ app.post('/api/conversations/:id/messages', async (req, res) => {
 
     res.json({ message });
   } catch (err) {
-    console.error('[messages] Failed to send message:', err.message || err);
+    log.error('[messages] Failed to send message:' + err.message || err);
     res.status(500).json({ error: 'Failed to send message' });
   }
 });
@@ -1695,7 +1722,7 @@ app.patch('/api/messages/:id/read', async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('[messages] Failed to mark read:', err.message || err);
+    log.error('[messages] Failed to mark read:' + err.message || err);
     res.status(500).json({ error: 'Failed to mark message as read' });
   }
 });
@@ -1717,7 +1744,7 @@ app.post('/api/conversations/:id/read-all', async (req, res) => {
     if (error) throw error;
     res.json({ success: true });
   } catch (err) {
-    console.error('[messages] Failed to mark all read:', err.message || err);
+    log.error('[messages] Failed to mark all read:' + err.message || err);
     res.status(500).json({ error: 'Failed to mark messages as read' });
   }
 });
@@ -1807,7 +1834,7 @@ app.get('/api/messages/contacts', async (req, res) => {
 
     res.json({ contacts: [] });
   } catch (err) {
-    console.error('[messages] Failed to get contacts:', err.message || err);
+    log.error('[messages] Failed to get contacts:' + err.message || err);
     res.status(500).json({ error: 'Failed to get contacts' });
   }
 });
@@ -1851,7 +1878,7 @@ app.post('/api/complaints', async (req, res) => {
     if (error) throw error;
     res.json({ complaint: data });
   } catch (err) {
-    console.error('[complaints] Failed to file complaint:', err.message || err);
+    log.error('[complaints] Failed to file complaint:' + err.message || err);
     res.status(500).json({ error: 'Failed to file complaint' });
   }
 });
@@ -1871,7 +1898,7 @@ app.get('/api/complaints/mine', async (req, res) => {
     if (error) throw error;
     res.json({ complaints: data || [] });
   } catch (err) {
-    console.error('[complaints] Failed to list complaints:', err.message || err);
+    log.error('[complaints] Failed to list complaints:' + err.message || err);
     res.status(500).json({ error: 'Failed to list complaints' });
   }
 });
@@ -1915,7 +1942,7 @@ app.get('/api/admin/complaints', async (req, res) => {
 
     res.json({ complaints: enriched });
   } catch (err) {
-    console.error('[admin] Failed to list complaints:', err.message || err);
+    log.error('[admin] Failed to list complaints:' + err.message || err);
     res.status(500).json({ error: 'Failed to list complaints' });
   }
 });
@@ -1949,7 +1976,7 @@ app.patch('/api/admin/complaints/:id', async (req, res) => {
     if (error) throw error;
     res.json({ complaint: data });
   } catch (err) {
-    console.error('[admin] Failed to update complaint:', err.message || err);
+    log.error('[admin] Failed to update complaint:' + err.message || err);
     res.status(500).json({ error: 'Failed to update complaint' });
   }
 });
@@ -1974,14 +2001,14 @@ app.get('/api/sessions', async (req, res) => {
       .limit(50);
 
     if (error) {
-      console.error('[supabase] Failed to fetch sessions:', error.message || error);
+      log.error('[supabase] Failed to fetch sessions:' + error.message || error);
       res.status(500).json({ error: 'Failed to fetch sessions' });
       return;
     }
 
     res.json({ sessions: data || [] });
   } catch (err) {
-    console.error('[supabase] Failed to fetch sessions:', err.message || err);
+    log.error('[supabase] Failed to fetch sessions:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch sessions' });
   }
 });
@@ -1996,9 +2023,9 @@ app.get('/api/report/analytics', async (req, res) => {
     if (membership?.role === 'trainer') {
       const members = await getOrgMembers(membership.organization_id);
       scopedUserIds = members.map((member) => member.user_id);
-      console.log('[org] Role detected: trainer');
+      log.info('[org] Role detected: trainer');
     } else if (membership?.role === 'trainee') {
-      console.log('[org] Role detected: trainee');
+      log.info('[org] Role detected: trainee');
     }
 
     const analytics = await fetchAnalyticsData(scopedUserIds);
@@ -2153,7 +2180,7 @@ app.get('/api/report/analytics', async (req, res) => {
 
     doc.end();
   } catch (err) {
-    console.error('[report] Failed to generate analytics report:', err.message || err);
+    log.error('[report] Failed to generate analytics report:' + err.message || err);
     res.status(500).json({ error: 'Failed to generate analytics report' });
   }
 });
@@ -2177,7 +2204,7 @@ app.get('/api/report/:sessionId', async (req, res) => {
       .maybeSingle();
 
     if (error) {
-      console.error('[supabase] Failed to fetch report session:', error.message || error);
+      log.error('[supabase] Failed to fetch report session:' + error.message || error);
       res.status(500).json({ error: 'Failed to fetch session' });
       return;
     }
@@ -2204,7 +2231,7 @@ app.get('/api/report/:sessionId', async (req, res) => {
         res.status(403).json({ error: 'Unauthorized' });
         return;
       }
-      console.log('[org] Role detected: trainer');
+      log.info('[org] Role detected: trainer');
     }
 
     const feedback = data.feedback || {};
@@ -2353,7 +2380,7 @@ app.get('/api/report/:sessionId', async (req, res) => {
 
     doc.end();
   } catch (err) {
-    console.error('[report] Failed to generate PDF report:', err.message || err);
+    log.error('[report] Failed to generate PDF report:' + err.message || err);
     res.status(500).json({ error: 'Failed to generate report' });
   }
 });
@@ -2371,9 +2398,9 @@ app.get('/api/analytics', async (req, res) => {
     if (membership?.role === 'trainer') {
       const members = await getOrgMembers(membership.organization_id);
       scopedUserIds = members.map((member) => member.user_id);
-      console.log('[org] Role detected: trainer');
+      log.info('[org] Role detected: trainer');
     } else if (membership?.role === 'trainee') {
-      console.log('[org] Role detected: trainee');
+      log.info('[org] Role detected: trainee');
     }
 
     const analytics = await fetchAnalyticsData(scopedUserIds);
@@ -2384,10 +2411,13 @@ app.get('/api/analytics', async (req, res) => {
       conversationMetrics: analytics.conversationMetrics,
     });
   } catch (err) {
-    console.error('[supabase] Failed to fetch analytics:', err.message || err);
+    log.error('[supabase] Failed to fetch analytics:' + err.message || err);
     res.status(500).json({ error: 'Failed to fetch analytics' });
   }
 });
+
+// ── Express error-handler (must be after all routes) ─────────────────────────
+app.use(errorMonitor.expressErrorHandler);
 
 const server = http.createServer(app);
 
@@ -2395,5 +2425,5 @@ const server = http.createServer(app);
 setupWebsocket(server);
 
 server.listen(PORT, () => {
-  console.log(`[http] Listening on http://localhost:${PORT}`);
+  log.info({ port: PORT }, `Server listening on http://localhost:${PORT}`);
 });

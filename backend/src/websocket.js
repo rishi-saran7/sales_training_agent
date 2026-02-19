@@ -7,6 +7,11 @@ const { supabase } = require('./lib/supabase');
 const { computeMetrics } = require('./metricsEngine');
 const { computeVoiceMetrics } = require('./voiceMetrics');
 
+// ── Observability ────────────────────────────────────────────────────────────
+const log = require('./lib/logger');
+const perf = require('./lib/perfTracker');
+const usage = require('./lib/usageTracker');
+
 const SILENCE_TIMEOUT_MS = 5000; // Fallback: 5 seconds after last speech to trigger LLM response.
                                  // Normally Deepgram's UtteranceEnd fires sooner (see utterance_end_ms).
 const COACH_HINT_COOLDOWN_MS = 10000;
@@ -234,7 +239,7 @@ function setupWebsocket(server) {
 
   wss.on('connection', (ws, req) => {
     const clientAddress = req.socket.remoteAddress;
-    console.log(`[ws] Client connected${clientAddress ? ` from ${clientAddress}` : ''}`);
+    log.info(`[ws] Client connected${clientAddress ? ` from ${clientAddress}` : ''}`);
 
     const streamState = createStreamState();
     let deepgramClient = null;
@@ -302,7 +307,7 @@ function setupWebsocket(server) {
         .limit(DIFFICULTY_CONFIG.sessionLookback);
 
       if (error) {
-        console.warn('[difficulty] Failed to fetch recent sessions:', error.message || error);
+        log.warn('[difficulty] Failed to fetch recent sessions:' + error.message || error);
         return null;
       }
 
@@ -337,18 +342,19 @@ function setupWebsocket(server) {
       coachHintSentForTurn = false;
       callStartTime = Date.now();
       sessionId = randomUUID();
+      usage.trackCallStart(userId || 'anonymous');
       resetConversationForScenario(scenario);
-      console.log(`[scenario] Call started under scenario: ${scenario.name}`);
+      log.info(`[scenario] Call started under scenario: ${scenario.name}`);
       if (difficultyContext) {
         currentDifficulty = difficultyContext.level;
         difficultyAverages = difficultyContext.averages;
-        console.log(
+        log.info(
           `[difficulty] Assigned ${currentDifficulty} (avg overall: ${
             difficultyAverages?.overall_score?.toFixed(2) ?? 'n/a'
           })`
         );
         if (difficultyAverages) {
-          console.log(
+          log.info(
             `[difficulty] Averages: overall=${difficultyAverages.overall_score?.toFixed(2) ?? 'n/a'}, ` +
               `objection=${difficultyAverages.objection_handling?.toFixed(2) ?? 'n/a'}, ` +
               `clarity=${difficultyAverages.communication_clarity?.toFixed(2) ?? 'n/a'}, ` +
@@ -369,7 +375,7 @@ function setupWebsocket(server) {
 
       const now = Date.now();
       if (now - lastCoachHintAt < COACH_HINT_COOLDOWN_MS) {
-        console.log('[coach] Hint skipped (cooldown)');
+        log.info('[coach] Hint skipped (cooldown)');
         coachHintSentForTurn = true;
         return;
       }
@@ -399,7 +405,7 @@ function setupWebsocket(server) {
 
         const cleaned = (hintText || '').trim();
         if (!cleaned || /^null$/i.test(cleaned) || /^none$/i.test(cleaned)) {
-          console.log('[coach] Hint skipped (none)');
+          log.info('[coach] Hint skipped (none)');
           return;
         }
 
@@ -409,9 +415,9 @@ function setupWebsocket(server) {
             text: cleaned,
           })
         );
-        console.log('[coach] Coaching hint generated');
+        log.info('[coach] Coaching hint generated');
       } catch (err) {
-        console.log('[coach] Hint skipped (error)');
+        log.info('[coach] Hint skipped (error)');
       }
     }
 
@@ -426,15 +432,18 @@ function setupWebsocket(server) {
       lastUserTurnEndTime = Date.now();
       turnTimestamps.push({ role: 'user', timestamp: lastUserTurnEndTime });
       const turnCount = Math.floor((conversation.length - 1) / 2);
-      console.log(`[llm] Turn ${turnCount} user transcript: "${text}"`);
+      log.info(`[llm] Turn ${turnCount} user transcript: "${text}"`);
 
       try {
+        const endLlmTimer = perf.start('llm', { sessionId, turn: turnCount });
+        usage.trackLLM(userId || 'anonymous');
         const responseText = await llmClient.generate(conversation);
+        endLlmTimer();
         if (callEnded) return;
         const safeResponse = responseText || '...';
         conversation.push({ role: 'assistant', content: safeResponse });
         turnTimestamps.push({ role: 'assistant', timestamp: Date.now() });
-        console.log(`[llm] Turn ${turnCount} customer reply: "${safeResponse}"`);
+        log.info(`[llm] Turn ${turnCount} customer reply: "${safeResponse}"`);
 
         ws.send(
           JSON.stringify({
@@ -446,7 +455,7 @@ function setupWebsocket(server) {
         // TODO: Stream LLM tokens directly to TTS for lower latency once streaming is enabled.
         // Generate TTS audio for the agent response.
         try {
-          console.log('[tts] Starting speech generation...');
+          log.info('[tts] Starting speech generation...');
           if (callEnded) return;
           interrupted = false; // Reset barge-in flag before starting new utterance.
           interruptNotified = false;
@@ -454,13 +463,16 @@ function setupWebsocket(server) {
           const currentTtsSession = ++ttsSessionId;
           let ttsStarted = false;
 
+          const endTtsTimer = perf.start('tts', { sessionId, turn: turnCount });
+          usage.trackTTS(userId || 'anonymous');
           const audioBuffer = await ttsClient.generateSpeech(safeResponse, {
             encoding: 'linear16',
             sampleRate: 16000,
           });
+          endTtsTimer();
 
           if (!audioBuffer || audioBuffer.length === 0) {
-            console.warn('[tts] Generated empty audio buffer; skipping playback');
+            log.warn('[tts] Generated empty audio buffer; skipping playback');
             agentSpeakingState = false;
             return;
           }
@@ -476,7 +488,7 @@ function setupWebsocket(server) {
           while (offset < audioBuffer.length) {
             // Barge-in: stop sending chunks immediately if user interrupted.
             if (callEnded || interrupted || currentTtsSession !== ttsSessionId) {
-              console.log(`[tts] Barge-in: cancelled remaining ${Math.ceil((audioBuffer.length - offset) / chunkSize)} chunks`);
+              log.info(`[tts] Barge-in: cancelled remaining ${Math.ceil((audioBuffer.length - offset) / chunkSize)} chunks`);
               break;
             }
             const chunk = audioBuffer.slice(offset, offset + chunkSize);
@@ -501,18 +513,18 @@ function setupWebsocket(server) {
               ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_INTERRUPT }));
               interruptNotified = true;
             }
-            console.log(`[tts] Agent speech interrupted after ${chunkCount} chunks`);
+            log.info(`[tts] Agent speech interrupted after ${chunkCount} chunks`);
           } else if (ttsStarted) {
             ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_END }));
-            console.log(`[tts] Sent ${chunkCount} audio chunks`);
+            log.info(`[tts] Sent ${chunkCount} audio chunks`);
           }
         } catch (ttsErr) {
-          console.error('[tts] Failed to generate speech:', ttsErr.message || ttsErr);
+          log.error('[tts] Failed to generate speech:' + ttsErr.message || ttsErr);
           agentSpeakingState = false;
           ws.send(JSON.stringify({ type: MESSAGE_TYPES.AGENT_AUDIO_END }));
         }
       } catch (err) {
-        console.error('[llm] Failed to generate response:', err.message || err);
+        log.error('[llm] Failed to generate response:' + err.message || err);
         ws.send(
           JSON.stringify({
             type: MESSAGE_TYPES.AGENT_TEXT,
@@ -549,7 +561,7 @@ function setupWebsocket(server) {
       const callDurationMin = Math.round(callDurationMs / 60000);
       const turnCount = Math.floor((conversation.length - 1) / 2);
 
-      console.log(`[feedback] Generating feedback for ${turnCount} turns, ${callDurationMin} min call`);
+      log.info(`[feedback] Generating feedback for ${turnCount} turns, ${callDurationMin} min call`);
 
       // Compute programmatic conversation intelligence metrics.
       let conversationMetrics = null;
@@ -560,9 +572,9 @@ function setupWebsocket(server) {
           interruptionCount,
           turnTimestamps,
         });
-        console.log(`[metrics] Talk ratio: ${conversationMetrics.talk_ratio}, Questions: ${conversationMetrics.user_questions_asked}, Engagement: ${conversationMetrics.engagement_score}`);
+        log.info(`[metrics] Talk ratio: ${conversationMetrics.talk_ratio}, Questions: ${conversationMetrics.user_questions_asked}, Engagement: ${conversationMetrics.engagement_score}`);
       } catch (metricsErr) {
-        console.error('[metrics] Failed to compute metrics:', metricsErr.message || metricsErr);
+        log.error('[metrics] Failed to compute metrics:' + metricsErr.message || metricsErr);
       }
 
       // Compute voice / audio intelligence metrics.
@@ -584,9 +596,9 @@ function setupWebsocket(server) {
           turnTimestamps,
           totalUserWords,
         });
-        console.log(`[voice-metrics] Speaking rate: ${audioMetrics.speaking_rate_wpm} wpm, Confidence: ${audioMetrics.confidence_score}/10, Clarity: ${audioMetrics.vocal_clarity_score}/10, Energy: ${audioMetrics.energy_score}/10`);
+        log.info(`[voice-metrics] Speaking rate: ${audioMetrics.speaking_rate_wpm} wpm, Confidence: ${audioMetrics.confidence_score}/10, Clarity: ${audioMetrics.vocal_clarity_score}/10, Energy: ${audioMetrics.energy_score}/10`);
       } catch (voiceErr) {
-        console.error('[voice-metrics] Failed to compute voice metrics:', voiceErr.message || voiceErr);
+        log.error('[voice-metrics] Failed to compute voice metrics:' + voiceErr.message || voiceErr);
       }
 
       // Extract conversation transcript for analysis.
@@ -617,16 +629,18 @@ function setupWebsocket(server) {
         'Return ONLY valid JSON. Do not include any explanatory text.';
 
       try {
+        const endFeedbackTimer = perf.start('feedback', { sessionId });
         const feedbackText = await llmClient.generate([
           { role: 'system', content: feedbackPrompt },
         ]);
+        endFeedbackTimer();
 
         // Parse and validate JSON.
         let feedbackData;
         try {
           feedbackData = JSON.parse(feedbackText);
         } catch (parseErr) {
-          console.error('[feedback] Failed to parse LLM JSON response:', parseErr);
+          log.error('[feedback] Failed to parse LLM JSON response:' + parseErr);
           throw new Error('LLM returned invalid JSON');
         }
 
@@ -647,8 +661,10 @@ function setupWebsocket(server) {
           }
         }
 
-        console.log('[feedback] Successfully generated feedback');
-        console.log(`[feedback] Overall score: ${feedbackData.overall_score}/10`);
+        log.info('[feedback] Successfully generated feedback');
+        log.info(`[feedback] Overall score: ${feedbackData.overall_score}/10`);
+        usage.trackCallEnd(userId || 'anonymous');
+        usage.trackSTT(userId || 'anonymous', callDurationMs / 1000);
 
         ws.send(
           JSON.stringify({
@@ -682,19 +698,19 @@ function setupWebsocket(server) {
             })
             .then(({ error }) => {
               if (error) {
-                console.error('[supabase] Failed to save session:', error.message || error);
+                log.error('[supabase] Failed to save session:' + error.message || error);
                 return;
               }
-              console.log('[supabase] Session saved successfully');
+              log.info('[supabase] Session saved successfully');
             })
             .catch((error) => {
-              console.error('[supabase] Failed to save session:', error.message || error);
+              log.error('[supabase] Failed to save session:' + error.message || error);
             });
         } else if (!currentUserId) {
-          console.log('[supabase] Session not saved (unauthenticated user)');
+          log.info('[supabase] Session not saved (unauthenticated user)');
         }
       } catch (err) {
-        console.error('[feedback] Failed to generate feedback:', err.message || err);
+        log.error('[feedback] Failed to generate feedback:' + err.message || err);
         ws.send(
           JSON.stringify({
             type: MESSAGE_TYPES.CALL_FEEDBACK,
@@ -746,47 +762,47 @@ function setupWebsocket(server) {
         deepgramClient = null;
       }
       currentUserId = null;
-      console.log(`[ws] Client disconnected${clientAddress ? ` from ${clientAddress}` : ''}`);
+      log.info(`[ws] Client disconnected${clientAddress ? ` from ${clientAddress}` : ''}`);
     });
 
     // TODO: In later phases, route incoming trainee audio/text to AI logic.
     ws.on('message', (data) => {
       const parsed = safeParseJson(data);
       if (!parsed || typeof parsed.type !== 'string') {
-        console.warn('[ws] Ignoring malformed message');
+        log.warn('[ws] Ignoring malformed message');
         return;
       }
 
       switch (parsed.type) {
         case MESSAGE_TYPES.AUTH: {
           if (!supabase) {
-            console.warn('[auth] Supabase not configured');
+            log.warn('[auth] Supabase not configured');
             break;
           }
           const token = typeof parsed.token === 'string' ? parsed.token : null;
           if (!token) {
-            console.warn('[auth] Missing token');
+            log.warn('[auth] Missing token');
             break;
           }
           supabase.auth
             .getUser(token)
             .then(({ data, error }) => {
               if (error || !data?.user) {
-                console.warn('[auth] Invalid token');
+                log.warn('[auth] Invalid token');
                 return;
               }
               currentUserId = data.user.id;
-              console.log('[auth] User authenticated for session');
+              log.info('[auth] User authenticated for session');
             })
             .catch(() => {
-              console.warn('[auth] Token verification failed');
+              log.warn('[auth] Token verification failed');
             });
           break;
         }
         case MESSAGE_TYPES.DIFFICULTY_MODE: {
           const enabled = typeof parsed.enabled === 'boolean' ? parsed.enabled : true;
           autoDifficultyEnabled = enabled;
-          console.log(`[difficulty] Auto difficulty ${enabled ? 'enabled' : 'disabled'}`);
+          log.info(`[difficulty] Auto difficulty ${enabled ? 'enabled' : 'disabled'}`);
           sendDifficultyUpdate(currentDifficulty, difficultyAverages);
           break;
         }
@@ -794,26 +810,26 @@ function setupWebsocket(server) {
           // Compute round-trip latency using the original ping timestamp from the client.
           if (typeof parsed.timestamp === 'number') {
             const latencyMs = Date.now() - parsed.timestamp;
-            console.log(`[ws] Pong received. RTT ~${latencyMs} ms`);
+            log.info(`[ws] Pong received. RTT ~${latencyMs} ms`);
           } else {
-            console.log('[ws] Pong received (no timestamp provided)');
+            log.info('[ws] Pong received (no timestamp provided)');
           }
           break;
         }
         case MESSAGE_TYPES.SCENARIO_SELECT: {
           if (scenarioLocked) {
-            console.log('[scenario] Selection ignored; scenario already locked for this session');
+            log.info('[scenario] Selection ignored; scenario already locked for this session');
             break;
           }
           const scenarioId = typeof parsed.scenarioId === 'string' ? parsed.scenarioId : null;
           const scenario = scenarioId && SCENARIO_MAP[scenarioId];
           if (!scenario) {
-            console.warn('[scenario] Unknown scenario selection; using default');
+            log.warn('[scenario] Unknown scenario selection; using default');
             break;
           }
           activeScenario = scenario;
           resetConversationForScenario(scenario);
-          console.log(`[scenario] Scenario selected: ${scenario.name}`);
+          log.info(`[scenario] Scenario selected: ${scenario.name}`);
           break;
         }
         case MESSAGE_TYPES.USER_AUDIO_START: {
@@ -830,12 +846,12 @@ function setupWebsocket(server) {
             streamState.sampleRate = typeof parsed.sampleRate === 'number' ? parsed.sampleRate : null;
             streamState.totalSamples = 0;
             streamState.startedAt = Date.now();
-            console.log('[ws] User audio start received');
+            log.info('[ws] User audio start received');
 
             // Establish Deepgram realtime session for this turn.
             const apiKey = process.env.DEEPGRAM_API_KEY;
             if (!apiKey) {
-              console.error('[ws] DEEPGRAM_API_KEY not set; cannot start Deepgram session');
+              log.error('[ws] DEEPGRAM_API_KEY not set; cannot start Deepgram session');
               ws.send(
                 JSON.stringify({
                   type: 'error',
@@ -890,7 +906,7 @@ function setupWebsocket(server) {
                     // Only flush if the user has stopped recording (pressed Stop Speaking).
                     // While the mic is active, we keep accumulating — USER_AUDIO_END will flush.
                     if (accumulatedTranscript && !streamState.active) {
-                      console.log('[ws] Fallback silence timer fired — flushing transcript');
+                      log.info('[ws] Fallback silence timer fired — flushing transcript');
                       const toSend = accumulatedTranscript;
                       accumulatedTranscript = '';
                       queueTranscript(toSend);
@@ -908,7 +924,7 @@ function setupWebsocket(server) {
                     silenceTimer = null;
                   }
                   if (accumulatedTranscript) {
-                    console.log('[ws] Deepgram UtteranceEnd — flushing transcript');
+                    log.info('[ws] Deepgram UtteranceEnd — flushing transcript');
                     const toSend = accumulatedTranscript;
                     accumulatedTranscript = '';
                     queueTranscript(toSend);
@@ -924,10 +940,10 @@ function setupWebsocket(server) {
             deepgramClient
               .connect()
               .then(() => {
-                console.log('[ws] Deepgram streaming started');
+                log.info('[ws] Deepgram streaming started');
               })
               .catch((err) => {
-                console.error('[ws] Failed to connect to Deepgram:', err);
+                log.error('[ws] Failed to connect to Deepgram:' + err);
                 ws.send(
                   JSON.stringify({
                     type: 'error',
@@ -936,18 +952,18 @@ function setupWebsocket(server) {
                 );
               });
           })().catch((err) => {
-            console.error('[difficulty] Failed to resolve difficulty:', err);
+            log.error('[difficulty] Failed to resolve difficulty:' + err);
           });
           break;
         }
         case MESSAGE_TYPES.USER_AUDIO_CHUNK: {
           if (!streamState.active) {
-            console.warn('[ws] Received audio chunk while no stream is active');
+            log.warn('[ws] Received audio chunk while no stream is active');
             break;
           }
 
           if (typeof parsed.payload !== 'string' || parsed.payload.length === 0) {
-            console.warn('[ws] Audio chunk missing payload');
+            log.warn('[ws] Audio chunk missing payload');
             break;
           }
 
@@ -960,20 +976,20 @@ function setupWebsocket(server) {
               ? Math.round((samples / streamState.sampleRate) * 1000)
               : 'unknown';
 
-            console.log(`[ws] Audio chunk received: ${bytes} bytes (~${chunkDurationMs} ms)`);
+            log.info(`[ws] Audio chunk received: ${bytes} bytes (~${chunkDurationMs} ms)`);
 
             // Forward audio to Deepgram for transcription.
             if (deepgramClient && deepgramClient.connected) {
               deepgramClient.sendAudio(buffer);
             }
           } catch (err) {
-            console.warn('[ws] Failed to decode audio chunk payload');
+            log.warn('[ws] Failed to decode audio chunk payload');
           }
           break;
         }
         case MESSAGE_TYPES.USER_AUDIO_END: {
           if (!streamState.active) {
-            console.warn('[ws] Received audio end while no stream is active');
+            log.warn('[ws] Received audio end while no stream is active');
             break;
           }
 
@@ -982,7 +998,7 @@ function setupWebsocket(server) {
             ? Math.round((streamState.totalSamples / streamState.sampleRate) * 1000)
             : null;
 
-          console.log(
+          log.info(
             `[ws] User audio end received. Approx stream duration: ${
               approxDurationMs !== null ? `${approxDurationMs} ms` : 'unknown'
             } (wall clock ${elapsedMs} ms)`
@@ -1026,11 +1042,11 @@ function setupWebsocket(server) {
         }
         case MESSAGE_TYPES.AGENT_AUDIO_CHUNK: {
           // TODO: This will originate from TTS output; for now just log.
-          console.log('[ws] Agent audio chunk received (placeholder)');
+          log.info('[ws] Agent audio chunk received (placeholder)');
           break;
         }
         case MESSAGE_TYPES.AGENT_AUDIO_END: {
-          console.log('[ws] Agent audio end received (placeholder)');
+          log.info('[ws] Agent audio end received (placeholder)');
           break;
         }
         case MESSAGE_TYPES.USER_INTERRUPT: {
@@ -1039,8 +1055,8 @@ function setupWebsocket(server) {
           interruptionCount += 1;
           ttsSessionId += 1; // Invalidate any in-flight TTS chunk loop.
           agentSpeakingState = false;
-          console.log('[barge-in] Interruption detected');
-          console.log('[barge-in] Agent speech cancelled');
+          log.info('[barge-in] Interruption detected');
+          log.info('[barge-in] Agent speech cancelled');
 
           // Always notify frontend to stop playback immediately.
           if (!interruptNotified) {
@@ -1051,11 +1067,11 @@ function setupWebsocket(server) {
         }
         case MESSAGE_TYPES.AGENT_TEXT: {
           // Should not be sent from client; log unexpected inbound traffic.
-          console.log('[ws] Unexpected agent.text from client');
+          log.info('[ws] Unexpected agent.text from client');
           break;
         }
         case MESSAGE_TYPES.CALL_END: {
-          console.log('[ws] Call end received, generating feedback...');
+          log.info('[ws] Call end received, generating feedback...');
           callEnded = true;
           interrupted = true;
           ttsSessionId += 1;
@@ -1076,7 +1092,7 @@ function setupWebsocket(server) {
           break;
         }
         case MESSAGE_TYPES.CALL_RESET: {
-          console.log('[ws] Call reset received, clearing session state');
+          log.info('[ws] Call reset received, clearing session state');
           callEnded = false;
           scenarioLocked = false;
           activeScenario = SCENARIO_MAP.price_sensitive_small_business;
@@ -1108,7 +1124,7 @@ function setupWebsocket(server) {
           break;
         }
         default: {
-          console.log(`[ws] Received message: ${data}`);
+          log.info(`[ws] Received message: ${data}`);
         }
       }
     });

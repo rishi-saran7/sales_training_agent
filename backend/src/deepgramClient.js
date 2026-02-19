@@ -1,4 +1,5 @@
 const WebSocket = require('ws');
+const log = require('./lib/logger');
 
 // Deepgram realtime WebSocket client for streaming PCM16 audio and receiving transcripts.
 // Docs: https://developers.deepgram.com/docs/streaming#websockets
@@ -28,7 +29,7 @@ class DeepgramClient {
         endpointing: '500',       // 500ms of silence within an utterance to finalise the sentence.
       });
 
-      console.log('[deepgram] Connecting to realtime endpoint...');
+      log.info('[deepgram] Connecting to realtime endpoint...');
       this.ws = new WebSocket(`${DEEPGRAM_URL}?${params.toString()}`, {
         headers: {
           Authorization: `Token ${this.apiKey}`,
@@ -37,7 +38,7 @@ class DeepgramClient {
 
       this.ws.on('open', () => {
         this.connected = true;
-        console.log('[deepgram] Connected');
+        log.info('[deepgram] Connected');
         resolve();
       });
 
@@ -46,13 +47,13 @@ class DeepgramClient {
       });
 
       this.ws.on('error', (err) => {
-        console.error('[deepgram] WebSocket error:', err);
+        log.error('[deepgram] WebSocket error:' + err);
         this.connected = false;
         reject(err);
       });
 
       this.ws.on('close', () => {
-        console.log('[deepgram] Closed');
+        log.info('[deepgram] Closed');
         this.connected = false;
       });
     });
@@ -63,7 +64,7 @@ class DeepgramClient {
     try {
       message = JSON.parse(data.toString());
     } catch (err) {
-      console.warn('[deepgram] Failed to parse message', err);
+      log.warn('[deepgram] Failed to parse message' + err);
       return;
     }
 
@@ -95,7 +96,7 @@ class DeepgramClient {
 
     const isFinal = Boolean(message.is_final);
     if (isFinal) {
-      console.log(`[deepgram] Final transcript: "${transcript}"`);
+      log.info(`[deepgram] Final transcript: "${transcript}"`);
       this.onEvent('stt.final', { text: transcript, confidence: avgConfidence });
     } else {
       this.onEvent('stt.partial', { text: transcript });
@@ -108,7 +109,7 @@ class DeepgramClient {
    */
   _handleMetaMessage(message) {
     if (message.type === 'UtteranceEnd') {
-      console.log('[deepgram] UtteranceEnd detected');
+      log.info('[deepgram] UtteranceEnd detected');
       this.onEvent('stt.utterance_end', {});
     }
   }

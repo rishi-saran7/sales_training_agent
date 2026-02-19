@@ -1,4 +1,5 @@
 const https = require('https');
+const log = require('./lib/logger');
 
 // Deepgram TTS REST endpoint for generating speech from text.
 // Docs: https://developers.deepgram.com/docs/text-to-speech
@@ -41,7 +42,7 @@ class TtsClient {
 
       const timeoutMs = 15000;
 
-      console.log(`[tts] Generating speech for text: "${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`);
+      log.info(`[tts] Generating speech for text: "${text.slice(0, 60)}${text.length > 60 ? '...' : ''}"`);
 
       const req = https.request(requestOptions, (res) => {
         if (res.statusCode !== 200) {
@@ -65,7 +66,7 @@ class TtsClient {
 
         res.on('end', () => {
           const audioBuffer = Buffer.concat(chunks);
-          console.log(`[tts] Generated ${totalBytes} bytes of audio`);
+          log.info(`[tts] Generated ${totalBytes} bytes of audio`);
           resolve(audioBuffer);
         });
 

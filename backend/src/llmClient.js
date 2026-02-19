@@ -1,6 +1,8 @@
 // Lightweight LLM chat completion client with pluggable provider settings.
 // Uses a REST endpoint compatible with OpenAI's chat/completions schema.
 
+const log = require('./lib/logger');
+
 const DEFAULT_MODEL = process.env.LLM_MODEL || 'gpt-3.5-turbo';
 const DEFAULT_BASE_URL = process.env.LLM_BASE_URL || 'https://api.openai.com/v1/chat/completions';
 const DEFAULT_PROVIDER = process.env.LLM_PROVIDER || 'openai-compatible';
