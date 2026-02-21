@@ -129,8 +129,8 @@ function safeParse(raw: string): AgentMessage | null {
 }
 
 // Shared constant so the WebSocket client points at the backend dev server.
-const WS_URL = "ws://localhost:3001";
-const API_BASE = "http://localhost:3001";
+const WS_URL = process.env.NEXT_PUBLIC_WS_URL || "ws://localhost:3001";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001";
 const TARGET_SAMPLE_RATE = 16000;
 const CHUNK_DURATION_MS = 32; // 20–40 ms target; 32 ms is a balanced middle.
 
@@ -172,6 +172,8 @@ type StartRecordingOptions = {
 
 export default function HomePage() {
   const router = useRouter();
+  // Use environment variable for API base, fallback to localhost for local dev
+  const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:3001";
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
   const [latency, setLatency] = useState<number | null>(null);
   const [micStatus, setMicStatus] = useState<MicStatus>("idle");
