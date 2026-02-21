@@ -342,7 +342,7 @@ function setupWebsocket(server) {
       coachHintSentForTurn = false;
       callStartTime = Date.now();
       sessionId = randomUUID();
-      usage.trackCallStart(userId || 'anonymous');
+      usage.trackCallStart(currentUserId || 'anonymous');
       resetConversationForScenario(scenario);
       log.info(`[scenario] Call started under scenario: ${scenario.name}`);
       if (difficultyContext) {
@@ -436,7 +436,7 @@ function setupWebsocket(server) {
 
       try {
         const endLlmTimer = perf.start('llm', { sessionId, turn: turnCount });
-        usage.trackLLM(userId || 'anonymous');
+        usage.trackLLM(currentUserId || 'anonymous');
         const responseText = await llmClient.generate(conversation);
         endLlmTimer();
         if (callEnded) return;
@@ -464,7 +464,7 @@ function setupWebsocket(server) {
           let ttsStarted = false;
 
           const endTtsTimer = perf.start('tts', { sessionId, turn: turnCount });
-          usage.trackTTS(userId || 'anonymous');
+          usage.trackTTS(currentUserId || 'anonymous');
           const audioBuffer = await ttsClient.generateSpeech(safeResponse, {
             encoding: 'linear16',
             sampleRate: 16000,
@@ -663,8 +663,8 @@ function setupWebsocket(server) {
 
         log.info('[feedback] Successfully generated feedback');
         log.info(`[feedback] Overall score: ${feedbackData.overall_score}/10`);
-        usage.trackCallEnd(userId || 'anonymous');
-        usage.trackSTT(userId || 'anonymous', callDurationMs / 1000);
+        usage.trackCallEnd(currentUserId || 'anonymous');
+        usage.trackSTT(currentUserId || 'anonymous', callDurationMs / 1000);
 
         ws.send(
           JSON.stringify({
