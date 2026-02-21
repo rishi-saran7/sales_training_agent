@@ -27,7 +27,12 @@ const app = express();
 app.use(express.json());
 
 // Allow the Next.js dev server to reach this API. Adjust origins when deploying.
-app.use(cors({ origin: 'http://localhost:3000' }));
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    'https://sales-training-agent-omega.vercel.app'
+  ]
+}));
 
 // ── Rate limiting ────────────────────────────────────────────────────────────
 app.use('/api/auth', authLimiter);
