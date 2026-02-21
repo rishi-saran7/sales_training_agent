@@ -820,7 +820,7 @@ export default function HomePage() {
     }
 
     try {
-      const response = await fetch("http://localhost:3001/api/sessions", {
+      const response = await fetch(`${API_BASE}/api/sessions`, {
         headers: {
           Authorization: `Bearer ${authTokenRef.current}`,
         },
@@ -844,7 +844,7 @@ export default function HomePage() {
     if (!authTokenRef.current) return;
 
     try {
-      const response = await fetch("http://localhost:3001/api/sessions", {
+      const response = await fetch(`${API_BASE}/api/sessions`, {
         headers: {
           Authorization: `Bearer ${authTokenRef.current}`,
         },
