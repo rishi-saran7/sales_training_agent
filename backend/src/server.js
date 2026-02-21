@@ -30,7 +30,7 @@ app.use(express.json());
 app.use(cors({
   origin: [
     'http://localhost:3000',
-    'https://sales-training-agent-omega.vercel.app'
+    'https://sales-training-agent-rishi-saran7s-projects.vercel.app'
   ]
 }));
 
