@@ -298,7 +298,12 @@ export default function HomePage() {
       bytes[i] = binary.charCodeAt(i);
     }
     // Convert PCM16 (int16) to Float32 for Web Audio API.
-    const samples = new Int16Array(bytes.buffer);
+    // Ensure buffer is ArrayBuffer, not SharedArrayBuffer
+    const arrayBuffer = bytes.buffer instanceof ArrayBuffer ? bytes.buffer : new ArrayBuffer(bytes.length);
+    if (!(bytes.buffer instanceof ArrayBuffer)) {
+      new Uint8Array(arrayBuffer).set(bytes);
+    }
+    const samples = new Int16Array(arrayBuffer);
     const floats = new Float32Array(samples.length);
     for (let i = 0; i < samples.length; i++) {
       floats[i] = samples[i] / 32768.0;
@@ -596,7 +601,10 @@ export default function HomePage() {
                 audioContextRef.current = new AudioContext();
               }
               const buffer = audioContextRef.current.createBuffer(1, floats.length, parsed.sampleRate);
-              buffer.copyToChannel(floats as Float32Array<ArrayBuffer>, 0);
+              // Ensure floats uses ArrayBuffer, not SharedArrayBuffer
+              const floatsFixed = new Float32Array(floats.length);
+              floatsFixed.set(floats);
+              buffer.copyToChannel(floatsFixed, 0);
               audioQueueRef.current.push(buffer);
               console.log(`[audio] Buffer added to queue. Queue length: ${audioQueueRef.current.length}`);
               // Start playback if not already playing.
