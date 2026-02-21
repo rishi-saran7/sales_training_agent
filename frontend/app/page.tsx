@@ -601,7 +601,8 @@ export default function HomePage() {
                 audioContextRef.current = new AudioContext();
               }
               const buffer = audioContextRef.current.createBuffer(1, floats.length, parsed.sampleRate);
-              // Ensure floats uses ArrayBuffer, not SharedArrayBuffer
+              // Ensure floats uses ArrayBuffer, not SharedArrayBuffer 
+              // ignore
               const floatsFixed = new Float32Array(floats.length);
               floatsFixed.set(floats);
               buffer.copyToChannel(floatsFixed, 0);
